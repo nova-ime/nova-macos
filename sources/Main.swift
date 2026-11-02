@@ -11,14 +11,13 @@ import InputMethodKit
 @main
 struct SquirrelApp {
   static let userDir = if let pwuid = getpwuid(getuid()) {
-    URL(fileURLWithFileSystemRepresentation: pwuid.pointee.pw_dir, isDirectory: true, relativeTo: nil).appending(components: "Library", "Rime")
+    URL(fileURLWithFileSystemRepresentation: pwuid.pointee.pw_dir, isDirectory: true, relativeTo: nil).appending(components: "Library", "NovaSquirrel")
   } else {
-    try! FileManager.default.url(for: .libraryDirectory, in: .userDomainMask, appropriateFor: nil, create: false).appendingPathComponent("Rime", isDirectory: true)
+    try! FileManager.default.url(for: .libraryDirectory, in: .userDomainMask, appropriateFor: nil, create: false).appendingPathComponent("NovaSquirrel", isDirectory: true)
   }
-  static let appDir = "/Library/Input Library/Squirrel.app".withCString { dir in
-    URL(fileURLWithFileSystemRepresentation: dir, isDirectory: false, relativeTo: nil)
-  }
-  static let logDir = FileManager.default.temporaryDirectory.appending(component: "rime.squirrel", directoryHint: .isDirectory)
+  // 装在 ~/Library/Input Methods，不和官方版抢 /Library/Input Methods/Squirrel.app。
+  static let appDir = Bundle.main.bundleURL
+  static let logDir = FileManager.default.temporaryDirectory.appending(component: "rime.nova-squirrel", directoryHint: .isDirectory)
 
   // swiftlint:disable:next cyclomatic_complexity
   static func main() {
@@ -34,8 +33,22 @@ struct SquirrelApp {
           let runningSquirrels = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
           runningSquirrels.forEach { $0.terminate() }
           return true
+#if DEBUG
+        case "--tree-preview":
+          // 开发用：把一段 nova_tree 画成 PNG，不经过输入法。
+          _ = NSApplication.shared
+          let panel = SquirrelPanel(position: .zero)
+          panel.tree = args[2].replacingOccurrences(of: "\\n", with: "\n").replacingOccurrences(of: "\\t", with: "\t")
+          panel.update(preedit: args[3], selRange: .empty, caretPos: 0, candidates: ["x"], comments: [""], labels: [], highlighted: 0, page: 0, lastPage: true, update: true)
+          if let view = panel.contentView, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+            view.cacheDisplay(in: view.bounds, to: rep)
+            try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: args[4]))
+          }
+          panel.hide()
+          return true
+#endif
         case "--reload":
-          DistributedNotificationCenter.default().postNotificationName(.init("SquirrelReloadNotification"), object: nil)
+          DistributedNotificationCenter.default().postNotificationName(.init("NovaSquirrelReloadNotification"), object: nil)
           return true
         case "--register-input-source", "--install":
           installer.register()
@@ -78,7 +91,7 @@ struct SquirrelApp {
           _ = rimeAPI.deploy()
           return true
         case "--sync":
-          DistributedNotificationCenter.default().postNotificationName(.init("SquirrelSyncNotification"), object: nil)
+          DistributedNotificationCenter.default().postNotificationName(.init("NovaSquirrelSyncNotification"), object: nil)
           return true
         case "--help":
           print(helpDoc)

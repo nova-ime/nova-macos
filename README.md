@@ -1,3 +1,15 @@
+> **Nova Squirrel** 是[鼠须管](https://github.com/rime/squirrel) 1.1.2 的硬分叉，独立开发，不计划合回上游，许可证同为 GPL-3.0。
+>
+> 相对上游的改动：
+> - 候选面板支持树状候选：整句切成词块，备选竖排在下方，按数字固定一块，其余部分重新解码。只在方案设置 `nova_tree/enabled: true` 时生效。
+> - 自带 Nova 方案（`nova-schema/`）：自然码双拼，大写字母输入辅助码，候选列出多条整句。词表依赖魔然的 `moran.extended`，本仓库不包含。
+> - 独立的 Bundle ID（`im.nova.inputmethod.NovaSquirrel`）和用户目录（`~/Library/NovaSquirrel`），可与官方鼠须管并存。
+> - 移除 Sparkle 自动更新。
+>
+> 构建和安装：`scripts/build-nova.sh`，然后 `scripts/install-nova.sh`。安装不需要 sudo，卸载加 `--uninstall`。构建需要 `lib/`、`bin/` 里已有 librime，见 INSTALL.md。`package/` 和 `Makefile` 的打包及安装目标还没有适配，不要用。本机临时签名，未经 Apple 公证。
+>
+> 以下内容沿用上游的说明。
+
     鼠鬚管
     爲物雖微情不淺
     新詩醉墨時一揮

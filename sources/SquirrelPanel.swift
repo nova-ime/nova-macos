@@ -155,6 +155,9 @@ final class SquirrelPanel: NSPanel {
   }
 
   // Main function to add attributes to text output from librime
+  // Nova 方案的树状候选（nova_tree 属性）；非空时代替候选列表。
+  var tree = ""
+
   // swiftlint:disable:next cyclomatic_complexity function_parameter_count
   func update(preedit: String, selRange: NSRange, caretPos: Int, candidates: [String], comments: [String], labels: [String], highlighted index: Int, page: Int, lastPage: Bool, update: Bool) {
     if update {
@@ -212,7 +215,7 @@ final class SquirrelPanel: NSPanel {
 
     // candidates
     var candidateRanges = [NSRange]()
-    for i in 0..<candidates.count {
+    for i in 0..<(tree.isEmpty ? candidates.count : 0) {
       let attrs = i == index ? theme.highlightedAttrs : theme.attrs
       let labelAttrs = i == index ? theme.labelHighlightedAttrs : theme.labelAttrs
       let commentAttrs = i == index ? theme.commentHighlightedAttrs : theme.commentAttrs
@@ -280,10 +283,14 @@ final class SquirrelPanel: NSPanel {
       text.append(line)
     }
 
+    if !tree.isEmpty {
+      candidateRanges = [appendTree(to: text, theme: theme)]
+    }
+
     // text done!
     view.textView.textContentStorage?.attributedString = text
     view.textView.setLayoutOrientation(vertical ? .vertical : .horizontal)
-    view.drawView(candidateRanges: candidateRanges, hilightedIndex: index, preeditRange: preeditRange, highlightedPreeditRange: highlightedPreeditRange, canPageUp: page > 0, canPageDown: !lastPage)
+    view.drawView(candidateRanges: candidateRanges, hilightedIndex: tree.isEmpty ? index : -1, preeditRange: preeditRange, highlightedPreeditRange: highlightedPreeditRange, canPageUp: page > 0, canPageDown: !lastPage)
     show()
   }
 
@@ -317,6 +324,102 @@ final class SquirrelPanel: NSPanel {
 }
 
 private extension SquirrelPanel {
+  // 词块横排、用连线串起来，备选竖排在对应词块下方，放不下时另起一排。
+  // swiftlint:disable:next function_body_length
+  func appendTree(to text: NSMutableAttributedString, theme: SquirrelTheme) -> NSRange {
+    struct Block {
+      let pinned: Bool
+      let word: String
+      let alts: [String]
+    }
+    struct Cell {
+      let block: Block
+      let labels: [Int]
+      let wordWidth: CGFloat
+      let width: CGFloat
+    }
+    func measure(_ string: String, _ attrs: [NSAttributedString.Key: Any]) -> CGFloat {
+      ceil(NSAttributedString(string: string, attributes: attrs).boundingRect(with: .zero, options: [.usesLineFragmentOrigin]).width)
+    }
+
+    let blocks = tree.split(separator: "\n").map { line -> Block in
+      let fields = line.split(separator: "\t").map(String.init)
+      return Block(pinned: fields.first == "1", word: fields.count > 4 ? fields[4] : "", alts: Array(fields.dropFirst(5)))
+    }
+    let dash = "─"
+    let dashWidth = max(1, measure(dash, theme.commentAttrs))
+    var label = 0
+    var tiers: [[Cell]] = [[]]
+    var tierWidth: CGFloat = 0
+    let maxWidth = maxTextWidth()
+    for block in blocks {
+      var labels = [Int]()
+      var altWidth: CGFloat = 0
+      for alt in block.alts {
+        label += 1
+        labels.append(label)
+        altWidth = max(altWidth, measure("\(label) ", theme.labelAttrs) + measure(alt, theme.commentAttrs))
+      }
+      let wordWidth = measure(block.word, theme.attrs)
+      let wanted = max(wordWidth + dashWidth * 2, altWidth + dashWidth)
+      let width = wordWidth + ceil((wanted - wordWidth) / dashWidth) * dashWidth
+      if tierWidth + width > maxWidth && !tiers[tiers.count - 1].isEmpty {
+        tiers.append([])
+        tierWidth = 0
+      }
+      tiers[tiers.count - 1].append(Cell(block: block, labels: labels, wordWidth: wordWidth, width: width))
+      tierWidth += width
+    }
+
+    let start = text.length
+    for (tierIndex, cells) in tiers.enumerated() {
+      let style = theme.paragraphStyle.mutableCopy() as! NSMutableParagraphStyle
+      var column: CGFloat = 0
+      var stops = [NSTextTab]()
+      for cell in cells.dropLast() {
+        column += cell.width
+        stops.append(NSTextTab(textAlignment: .left, location: column))
+      }
+      style.tabStops = stops
+      style.defaultTabInterval = 0
+      style.headIndent = 0
+      style.firstLineHeadIndent = 0
+      style.lineBreakMode = .byClipping
+
+      let rows = NSMutableAttributedString()
+      for (i, cell) in cells.enumerated() {
+        var attrs = theme.attrs
+        if cell.block.pinned {
+          attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
+        }
+        rows.append(NSAttributedString(string: cell.block.word, attributes: attrs))
+        if i < cells.count - 1 {
+          let count = Int(((cell.width - cell.wordWidth) / dashWidth).rounded())
+          rows.append(NSAttributedString(string: String(repeating: dash, count: count), attributes: theme.commentAttrs))
+        }
+      }
+      let depth = cells.map { $0.block.alts.count }.max() ?? 0
+      for row in 0..<depth {
+        rows.append(NSAttributedString(string: "\n", attributes: theme.commentAttrs))
+        for (i, cell) in cells.enumerated() {
+          if i > 0 {
+            rows.append(NSAttributedString(string: "\t", attributes: theme.commentAttrs))
+          }
+          if row < cell.block.alts.count {
+            rows.append(NSAttributedString(string: "\(cell.labels[row]) ", attributes: theme.labelAttrs))
+            rows.append(NSAttributedString(string: cell.block.alts[row], attributes: theme.commentAttrs))
+          }
+        }
+      }
+      rows.addAttribute(.paragraphStyle, value: style, range: NSRange(location: 0, length: rows.length))
+      if tierIndex > 0 {
+        text.append(NSAttributedString(string: "\n", attributes: theme.commentAttrs))
+      }
+      text.append(rows)
+    }
+    return NSRange(location: start, length: text.length - start)
+  }
+
   func mousePosition() -> NSPoint {
     var point = NSEvent.mouseLocation
     point = self.convertPoint(fromScreen: point)

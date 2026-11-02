@@ -1,0 +1,87 @@
+# Rime schema
+# encoding: utf-8
+#
+# 自然码双拼整句输入。辅助码只认大写：niRE 是「你」，nire 是「ni re」两个音节。
+# 词表复用 moran.extended 的 `音节;辅助码` 编码。
+
+schema:
+  schema_id: nova
+  name: Nova
+  version: "1"
+  description: 自然码双拼整句，大写字母输入两分辅助码。
+
+switches:
+  - name: ascii_mode
+    states: [中文, 英文]
+  - name: full_shape
+    states: [半角, 全角]
+  - name: ascii_punct
+    states: [。，, ．，]
+
+engine:
+  processors:
+    - ascii_composer
+    - recognizer
+    - key_binder
+    - lua_processor@*nova_tree_keys
+    - speller
+    - punctuator
+    - selector
+    - navigator
+    - express_editor
+  segmentors:
+    - ascii_segmentor
+    - matcher
+    - abc_segmentor
+    - punct_segmentor
+    - fallback_segmentor
+  translators:
+    - punct_translator
+    - script_translator
+  filters:
+    - lua_filter@*nova_sentences
+    - uniquifier
+
+speller:
+  alphabet: abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ
+  # 大写不能开头：没有音节时按 Shift 打字母直接出英文。
+  initials: abcdefghijklmnopqrstuvwxyz
+  delimiter: " '"
+  algebra:
+    - derive/^(.+);(\w)(\w)$/$1\u$2/
+    - derive/^(.+);(\w)(\w)$/$1\u$2\u$3/
+    - derive/^(.+);(\w)(\w)$/$1/
+    - erase/^(.+);(.+)$/
+
+translator:
+  dictionary: moran.extended
+  prism: nova
+  contextual_suggestions: true
+  max_homophones: 7
+  spelling_hints: 0
+
+key_binder:
+  import_preset: default
+
+punctuator:
+  import_preset: default
+
+# 不继承 default 的 uppercase 规则：它不锚定开头，会把音节后的大写字母切成英文段。
+recognizer:
+  patterns:
+    punct: '^/([0-9]0?|[A-Za-z]+)$'
+    uppercase: "^[A-Z][-_+.'0-9A-Za-z]*$"
+
+# 语法模型：整句排序靠它。
+grammar:
+  language: zh-hans-t-essay-bgw
+  collocation_max_length: 4
+  collocation_min_length: 3
+
+# 每个词的罚项，和 log 词频同一量纲。100 句测试里 20 最好（0 时会拆成很多单字）。
+nova_sentences:
+  word_penalty: 20
+
+nova_tree:
+  enabled: true
+  debug: false

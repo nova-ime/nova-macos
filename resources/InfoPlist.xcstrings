@@ -7,19 +7,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Squirrel"
+            "value" : "Nova Squirrel"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "鼠须管"
+            "value" : "Nova 鼠须管"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "鼠鬚管"
+            "value" : "Nova 鼠鬚管"
           }
         }
       }
@@ -31,47 +31,47 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Squirrel"
+            "value" : "Nova Squirrel"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "鼠须管"
+            "value" : "Nova 鼠须管"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "鼠鬚管"
+            "value" : "Nova 鼠鬚管"
           }
         }
       }
     },
-    "im.rime.inputmethod.Squirrel" : {
+    "im.nova.inputmethod.NovaSquirrel" : {
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Squirrel"
+            "value" : "Nova Squirrel"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "鼠须管"
+            "value" : "Nova 鼠须管"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "鼠鬚管"
+            "value" : "Nova 鼠鬚管"
           }
         }
       }
     },
-    "im.rime.inputmethod.Squirrel.Hans" : {
+    "im.nova.inputmethod.NovaSquirrel.Hans" : {
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -83,18 +83,18 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "鼠须管"
+            "value" : "Nova 鼠须管"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "鼠须管"
+            "value" : "Nova 鼠须管"
           }
         }
       }
     },
-    "im.rime.inputmethod.Squirrel.Hant" : {
+    "im.nova.inputmethod.NovaSquirrel.Hant" : {
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -106,13 +106,13 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "鼠鬚管"
+            "value" : "Nova 鼠鬚管"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "鼠鬚管"
+            "value" : "Nova 鼠鬚管"
           }
         }
       }
