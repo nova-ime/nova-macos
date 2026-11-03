@@ -133,6 +133,21 @@ final class SquirrelInputController: IMKInputController {
     return success
   }
 
+  // 数字键由 nova_tree_keys.lua 处理，点击备选走同一条路。
+  func pinAlternative(_ label: Int) {
+    if rimeAPI.process_key(session, Int32(0x30 + label), 0) {
+      rimeUpdate()
+    }
+  }
+
+  // 和 ←/→ 走同一条路，由 nova_tree_keys.lua 处理。
+  func moveFocus(by step: Int) {
+    for _ in 0..<abs(step) {
+      _ = rimeAPI.process_key(session, Int32(step < 0 ? XK_Left : XK_Right), 0)
+    }
+    rimeUpdate()
+  }
+
   // swiftlint:disable:next identifier_name
   func page(up: Bool) -> Bool {
     var handled = false
@@ -370,10 +385,6 @@ private extension SquirrelInputController {
       if panel.linear != rimeAPI.get_option(session, "_linear") {
         rimeAPI.set_option(session, "_linear", panel.linear)
       }
-      // with vertical text, arrow keys may behave differently.
-      if panel.vertical != rimeAPI.get_option(session, "_vertical") {
-        rimeAPI.set_option(session, "_vertical", panel.vertical)
-      }
     }
 
     let handled = rimeAPI.process_key(session, Int32(rimeKeycode), Int32(rimeModifiers))
@@ -524,18 +535,17 @@ private extension SquirrelInputController {
         }
       }
       // swiftlint:enable identifier_name
-      let page = Int(ctx.menu.page_no)
-      let lastPage = ctx.menu.is_last_page
-
       // 要在 get_context 之后读：nova_tree 由候选过滤器在生成菜单时写入。
       var treeBuffer = [CChar](repeating: 0, count: 8192)
-      let hasTree = rimeAPI.get_property(session, "nova_tree", &treeBuffer, treeBuffer.count) && numCandidates > 0
-      NSApp.squirrelAppDelegate.panel?.tree = hasTree ? String(cString: treeBuffer) : ""
+      // 翻页或移动高亮是在找树上没有的候选，这时才显示普通列表。
+      let browsing = ctx.menu.page_no > 0 || ctx.menu.highlighted_candidate_index > 0
+      let hasTree = !browsing && rimeAPI.get_property(session, "nova_tree", &treeBuffer, treeBuffer.count) && numCandidates > 0
+      let tree = hasTree ? String(cString: treeBuffer) : ""
 
       let selRange = NSRange(location: start.utf16Offset(in: preedit), length: preedit.utf16.distance(from: start, to: end))
-      showPanel(preedit: inlinePreedit ? "" : preedit, selRange: selRange, caretPos: caretPos.utf16Offset(in: preedit),
-                candidates: candidates, comments: comments, labels: labels, highlighted: Int(ctx.menu.highlighted_candidate_index),
-                page: page, lastPage: lastPage)
+      // 空行表示还没有词块（只打了一个字母），这时什么都不显示。
+      showPanel(preedit: inlinePreedit ? "" : preedit, selRange: selRange, tree: tree,
+                candidates: tree == "\n" ? [] : candidates, comments: comments, labels: labels, highlighted: Int(ctx.menu.highlighted_candidate_index))
       _ = rimeAPI.free_context(&ctx)
     } else {
       hidePalettes()
@@ -575,16 +585,21 @@ private extension SquirrelInputController {
   }
 
   // swiftlint:disable:next function_parameter_count
-  func showPanel(preedit: String, selRange: NSRange, caretPos: Int, candidates: [String], comments: [String], labels: [String], highlighted: Int, page: Int, lastPage: Bool) {
-    // print("[DEBUG] showPanelWithPreedit:...:")
-    guard let client = client else { return }
+  func showPanel(preedit: String, selRange: NSRange, tree: String, candidates: [String], comments: [String], labels: [String], highlighted: Int) {
+    guard let client = client, let panel = NSApp.squirrelAppDelegate.panel else { return }
     var inputPos = NSRect()
     client.attributes(forCharacterIndex: 0, lineHeightRectangle: &inputPos)
-    if let panel = NSApp.squirrelAppDelegate.panel {
-      panel.position = inputPos
-      panel.inputController = self
-      panel.update(preedit: preedit, selRange: selRange, caretPos: caretPos, candidates: candidates, comments: comments, labels: labels,
-                   highlighted: highlighted, page: page, lastPage: lastPage, update: true)
+    panel.position = inputPos
+    panel.inputController = self
+    var content = NovaContent()
+    content.preedit = preedit
+    content.selRange = selRange
+    content.blocks = NovaBlock.parse(tree: tree)
+    content.highlighted = highlighted
+    content.candidates = candidates.indices.map { index in
+      let label = index < labels.count ? labels[index] : "\(index + 1)"
+      return NovaCandidate(label: label, text: candidates[index].precomposedStringWithCanonicalMapping, comment: comments[index].precomposedStringWithCanonicalMapping)
     }
+    panel.update(content)
   }
 }

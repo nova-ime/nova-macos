@@ -15,10 +15,10 @@ final class SquirrelApplicationDelegate: NSObject, NSApplicationDelegate, UNUser
 
   let rimeAPI: RimeApi_stdbool = rime_get_api_stdbool().pointee
   var config: SquirrelConfig?
-  var panel: SquirrelPanel?
+  var panel: NovaPanel?
   var enableNotifications = false
   func applicationWillFinishLaunching(_ notification: Notification) {
-    panel = SquirrelPanel(position: .zero)
+    panel = NovaPanel()
     addObservers()
   }
 
@@ -119,8 +119,7 @@ final class SquirrelApplicationDelegate: NSObject, NSApplicationDelegate, UNUser
 
     enableNotifications = config!.getString("show_notifications_when") != "never"
     if let panel = panel, let config = self.config {
-      panel.load(config: config, forDarkMode: false)
-      panel.load(config: config, forDarkMode: true)
+      panel.load(config: config)
     }
   }
 
@@ -131,11 +130,9 @@ final class SquirrelApplicationDelegate: NSObject, NSApplicationDelegate, UNUser
     let schema = SquirrelConfig()
     if let panel = panel, let config = self.config {
       if schema.open(schemaID: schemaID, baseConfig: config) && schema.has(section: "style") {
-        panel.load(config: schema, forDarkMode: false)
-        panel.load(config: schema, forDarkMode: true)
+        panel.load(config: schema)
       } else {
-        panel.load(config: config, forDarkMode: false)
-        panel.load(config: config, forDarkMode: true)
+        panel.load(config: config)
       }
     }
     schema.close()

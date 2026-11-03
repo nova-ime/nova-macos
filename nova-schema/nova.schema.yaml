@@ -82,6 +82,12 @@ grammar:
 nova_sentences:
   word_penalty: 20
 
+# 输入框里直接显示首选整句，不显示双拼。
+style:
+  inline_candidate: true
+  # 在词和备选下面显示词频比例。改完要重新部署。
+  show_share: false
+
 nova_tree:
   enabled: true
   debug: false

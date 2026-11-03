@@ -9,15 +9,19 @@ local BEAM = 8                 -- 每个位置保留的路径数
 local EXTRA = 5                -- 补几条整句
 local CACHE_LIMIT = 2000
 
+-- 返回完整音节和结尾没打完的单个字母。没打完的字母不参与解码，词块也就不会每敲一键变一次。
 local function syllables(input)
     local tokens, pos = {}, 1
     while pos <= #input do
         local token = input:match("^[a-z][a-z][A-Z]?[A-Z]?", pos)
-        if not token then return nil end
+        if not token then
+            local pending = input:match("^[a-z]$", pos)
+            return pending and tokens or nil, pending or ""
+        end
         tokens[#tokens + 1] = token
         pos = pos + #token
     end
-    return tokens
+    return tokens, ""
 end
 
 -- 从 tokens[first] 开始的所有词，返回 { [音节数] = { {text, score}, ... } }。
@@ -57,7 +61,7 @@ local function words_from(env, tokens, first)
         end
     end
     if env.cache_size >= CACHE_LIMIT then
-        env.cache, env.cache_size = {}, 0
+        env.cache, env.cache_size, env.weights = {}, 0, {}
     end
     env.cache[key] = by_end
     env.cache_size = env.cache_size + 1
@@ -103,12 +107,23 @@ end
 
 
 -- 树状候选 ----------------------------------------------------------------
--- nova_tree 属性：每块一行，`固定\t起\t止\t键\t文字\t备选...`，起止是段内字节偏移。
--- nova_pins 属性：每个固定段一行，`起:止:键:文字`。
+-- nova_tree 属性：每块一行，`标记\t起\t止\t键\t文字\t备选...`，起止是段内字节偏移。
+--   标记末尾的 a数字 是这块已经稳定了几个音节，见 frozen_lines。
+--   标记：首字符 1 表示用户选过，0 表示没有；含 f 是焦点块；含 c 是整句解码选了词频较低的词；
+--   含 o 是没有焦点时直接显示备选的不确定块，数字键从左到右连续编号。
+--   文字：`文字\31比例`；备选：`文字\31比例\31止`，长度可以和块不同。
+--   比例是在同段候选里占的词频比例，不是真实概率，可以为空。
+-- nova_pins 属性：每个固定段一行，`起:止:键:h|s:文字`。h 是用户选的；s 是选词时冻结的其他块，
+--   这样改一处不会让别处重新解码。
+-- nova_pins_end 属性：选词时的输入长度，见 parse_pins。
+-- nova_focus 属性：`起:输入`。空或输入变了就是没有焦点。
 
 local MAX_BLOCK_SYLLABLES = 3  -- 词库有「我很喜欢」这样的短语，块太长就没有东西可选
-local ALTS_PER_BLOCK = 3
+local MAX_ALTS = 6
+local MAX_SAME_LENGTH_ALTS = 4 -- 给别的长度留位置，切分错了才改得了
+local OVERVIEW_ALTS = 2        -- 没有焦点时每个不确定块显示几个备选
 local MAX_LABELS = 9
+local CONFIDENT_SHARE = 80     -- 比例低于这个值算不确定，和面板的橙色一致
 
 local function char_sub(text, first, last)
     local from = utf8.offset(text, first)
@@ -142,6 +157,45 @@ local function decode(env, tokens, first, last)
     return nil
 end
 
+-- quality 是一个随查询变化的底数加归一化词频，同一段候选的底数相同。
+-- 这里减掉这段里最低的 quality，近似得到词频。只有两三个同音词时会偏向首位。
+local function span_weights(env, key, want)
+    local cached = env.weights[key]
+    if cached then return cached end
+    local top, count, lowest = {}, 0, math.huge
+    local seg = Segment(0, #key)
+    seg.tags = Set { "abc" }
+    local translation = env.translator:query(key, seg)
+    if translation then
+        local nxt, this = translation:iter()
+        for _ = 1, 100 do
+            local cand = nxt(this)
+            if not cand then break end
+            if cand._end == #key and cand.type ~= "sentence" and utf8.len(cand.text) == want then
+                lowest = math.min(lowest, cand.quality)
+                if count < WORDS_PER_SPAN then
+                    top[cand.text] = cand.quality
+                    count = count + 1
+                end
+            end
+        end
+    end
+    local weights = {}
+    for text, quality in pairs(top) do weights[text] = quality - lowest end
+    env.weights[key] = weights
+    return weights
+end
+
+-- text 占这组候选词频的比例（0-100），不在里面时返回 nil。
+local function share_of(weights, text)
+    local own = weights[text]
+    if not own then return nil end
+    local total = 0
+    for _, weight in pairs(weights) do total = total + weight end
+    if total <= 0 then return nil end
+    return math.floor(own * 100 / total + 0.5)
+end
+
 -- 把 tokens[first..last] 的文字切成词块，取词库里最长的词。
 local function split_blocks(env, tokens, first, last, text, blocks)
     local i = first
@@ -156,31 +210,28 @@ local function split_blocks(env, tokens, first, last, text, blocks)
             if length > 1 then break end
         end
         local piece = char_sub(text, i - first + 1, i - first + length)
-        local alts = {}
-        for _, word in ipairs(by_length[length] or {}) do
-            if word[1] ~= piece and utf8.len(word[1]) == length then
-                alts[#alts + 1] = word[1]
-                if #alts >= ALTS_PER_BLOCK then break end
-            end
-        end
-        blocks[#blocks + 1] = { pinned = false, first = i, last = i + length - 1, text = piece, alts = alts }
+        blocks[#blocks + 1] = { pinned = false, first = i, last = i + length - 1, text = piece }
         i = i + length
     end
 end
 
-local function parse_pins(env, tokens, offsets, input)
-    local value = env.engine.context:get_property("nova_pins") or ""
+-- extra 是自动冻结的块，写在用户的固定段前面，同一位置以用户的为准。
+local function parse_pins(env, tokens, offsets, input, extra)
+    local value = (extra or "") .. (env.engine.context:get_property("nova_pins") or "")
     local start_at, end_at = {}, {}
     for i = 1, #tokens do
         start_at[offsets[i]] = i
         end_at[offsets[i] + #tokens[i]] = i
     end
     local pins = {}
-    for from, to, key, text in value:gmatch("(%d+):(%d+):([^:]*):([^\n]*)") do
+    -- 选词时的最后一块在继续打字后要能和新字母组词，不再冻结。
+    local open_end = tonumber(env.engine.context:get_property("nova_pins_end") or "")
+    for from, to, key, kind, text in value:gmatch("(%d+):(%d+):([^:]*):([hs]):([^\n]*)") do
         from, to = tonumber(from), tonumber(to)
         local i, j = start_at[from], end_at[to]
-        if i and j and input:sub(from + 1, to) == key and utf8.len(text) == j - i + 1 then
-            pins[i] = { last = j, text = text }
+        local reopened = kind == "s" and to == open_end and #input > open_end
+        if i and j and not reopened and input:sub(from + 1, to) == key and utf8.len(text) == j - i + 1 then
+            pins[i] = { last = j, text = text, chosen = kind == "h" }
         end
     end
     return pins
@@ -191,12 +242,14 @@ local function build_blocks(env, tokens, pins, default_text)
     local has_pin = next(pins) ~= nil
     while i <= n do
         if pins[i] then
-            blocks[#blocks + 1] = { pinned = true, first = i, last = pins[i].last, text = pins[i].text, alts = {} }
+            blocks[#blocks + 1] = { pinned = pins[i].chosen, first = i, last = pins[i].last, text = pins[i].text }
             i = pins[i].last + 1
         else
             local stop = i
             while stop < n and not pins[stop + 1] do stop = stop + 1 end
-            local text = has_pin and decode(env, tokens, i, stop) or default_text
+            -- 优先取整句首选里对应的字，它带着前后文；首选字数对不上音节时（词库里的「喜欢你」）
+            -- 才单独解码这一段。
+            local text = default_text and char_sub(default_text, i, stop) or decode(env, tokens, i, stop)
             if not text then return nil end
             split_blocks(env, tokens, i, stop, text, blocks)
             i = stop + 1
@@ -205,18 +258,105 @@ local function build_blocks(env, tokens, pins, default_text)
     return blocks
 end
 
-local function serialize(blocks, tokens, offsets)
-    local lines, labels = {}, 0
-    for _, block in ipairs(blocks) do
-        local from = offsets[block.first]
-        local to = offsets[block.last] + #tokens[block.last]
-        local fields = { block.pinned and "1" or "0", tostring(from), tostring(to),
-                         table.concat(tokens, "", block.first, block.last), block.text }
-        for _, alt in ipairs(block.alts) do
-            if labels < MAX_LABELS then
-                labels = labels + 1
-                fields[#fields + 1] = alt
+-- 焦点块的备选：先放同样长度的词，再每种长度放一个，用来重新切分。
+local function alternatives(env, tokens, offsets, block)
+    local result, seen = {}, { [block.text] = true }
+    local by_length = words_from(env, tokens, block.first)
+    local function add(length, limit)
+        local last = block.first + length - 1
+        if last > #tokens then return end
+        local key = table.concat(tokens, "", block.first, last)
+        local added = 0
+        for _, word in ipairs(by_length[length] or {}) do
+            if added >= limit or #result >= MAX_ALTS then return end
+            if not seen[word[1]] and utf8.len(word[1]) == length then
+                seen[word[1]] = true
+                result[#result + 1] = { text = word[1], to = offsets[last] + #tokens[last],
+                                        share = share_of(span_weights(env, key, length), word[1]) }
+                added = added + 1
             end
+        end
+    end
+    local length = block.last - block.first + 1
+    add(length, MAX_SAME_LENGTH_ALTS)
+    for other = length - 1, 1, -1 do add(other, 1) end
+    for other = length + 1, MAX_BLOCK_SYLLABLES do add(other, 1) end
+    add(length, MAX_ALTS)
+    return result
+end
+
+local function focused_index(env, blocks, offsets, input)
+    local from, text = (env.engine.context:get_property("nova_focus") or ""):match("^(%d+):(.*)$")
+    if text == input then
+        from = tonumber(from)
+        for i, block in ipairs(blocks) do
+            if offsets[block.last] >= from then return i end
+        end
+    end
+    return nil
+end
+
+local function field(...)
+    local parts = { ... }
+    for i = 1, select("#", ...) do parts[i] = parts[i] == nil and "" or tostring(parts[i]) end
+    return table.concat(parts, "\31", 1, select("#", ...))
+end
+
+-- 块的词频比例，以及整句解码是否选了词频较低的词。
+local function measure_block(env, block, tokens)
+    local key = table.concat(tokens, "", block.first, block.last)
+    local weights = span_weights(env, key, block.last - block.first + 1)
+    block.key = key
+    block.share = not block.pinned and share_of(weights, block.text) or nil
+    -- 一两个字的词不在词频最高的几个里，多半选错了，比例记 0。
+    -- 三个字的常是短语，词库里排得靠后不代表错。
+    if not block.pinned and block.last - block.first < 2 and next(weights) and not weights[block.text] then
+        block.share = 0
+    end
+    block.corrected = false
+    if block.share then
+        for text in pairs(weights) do
+            if text ~= block.text and (share_of(weights, text) or 0) > block.share then block.corrected = true; break end
+        end
+    end
+end
+
+-- 编号不够时，让最不确定的块先拿到，每块要么全有要么没有。
+local function pick_overview(env, blocks, tokens, offsets)
+    local uncertain = {}
+    for _, block in ipairs(blocks) do
+        if block.corrected or (block.share and block.share < CONFIDENT_SHARE) then
+            uncertain[#uncertain + 1] = block
+        end
+    end
+    table.sort(uncertain, function(a, b) return a.share < b.share end)
+    local labels = 0
+    for _, block in ipairs(uncertain) do
+        local alts = alternatives(env, tokens, offsets, block)
+        for i = #alts, OVERVIEW_ALTS + 1, -1 do alts[i] = nil end
+        if #alts > 0 and labels + #alts <= MAX_LABELS then
+            block.overview = alts
+            labels = labels + #alts
+        end
+    end
+end
+
+local function serialize(env, blocks, tokens, offsets, focus, ages)
+    for _, block in ipairs(blocks) do measure_block(env, block, tokens) end
+    pick_overview(env, blocks, tokens, offsets)
+    local lines = {}
+    for i, block in ipairs(blocks) do
+        local flags = block.pinned and "1" or "0"
+        if i == focus then flags = flags .. "f" end
+        if block.corrected then flags = flags .. "c" end
+        if block.overview then flags = flags .. "o" end
+        local from, to = offsets[block.first], offsets[block.last] + #tokens[block.last]
+        flags = flags .. "a" .. (ages[from .. ":" .. to .. ":" .. block.text] or 0)
+        local fields = { flags, tostring(offsets[block.first]), tostring(offsets[block.last] + #tokens[block.last]),
+                         block.key, field(block.text, block.share) }
+        local alts = i == focus and alternatives(env, tokens, offsets, block) or block.overview or {}
+        for _, alt in ipairs(alts) do
+            fields[#fields + 1] = field(alt.text, alt.share, alt.to)
         end
         lines[#lines + 1] = table.concat(fields, "\t")
     end
@@ -238,9 +378,75 @@ local function token_offsets(tokens)
     return offsets
 end
 
+-- 打过去的词不再跟着后面的字变。上一次的树里，除了最后一块，多字词满足其一就冻结：
+--   有把握（占比够高），或者之后又打了 STABLE_SYLLABLES 个音节都没变（用户看过、认了）。
+-- 单字和刚出现的没把握的词照样跟着整句解码变（无党 → 武当、无 → 武当）。
+-- 输入没变时（移动焦点、选词后刷新），或者只多了一个没打完的字母，整棵树原样保留，
+-- 不然同一个输入会来回跳，半个音节也会让前面的词闪一下。
+local FREEZE_SHARE = 50
+local STABLE_SYLLABLES = 2
+
+-- 上一次的树：每块的字段和它已经稳定了几个音节（标记里的数字）。
+local function previous_blocks(previous)
+    local blocks = {}
+    for line in previous:gmatch("[^\n]+") do
+        local fields = {}
+        for value in line:gmatch("[^\t]+") do fields[#fields + 1] = value end
+        if #fields >= 5 then
+            local text, share = fields[5]:match("^([^\31]*)\31?(%d*)")
+            blocks[#blocks + 1] = { from = fields[2], to = fields[3], key = fields[4], text = text,
+                                    share = tonumber(share) or 0, age = tonumber(fields[1]:match("a(%d+)")) or 0 }
+        end
+    end
+    return blocks
+end
+
+local function frozen_lines(previous, same_input)
+    local lines = {}
+    for i, block in ipairs(previous) do
+        local settled = i < #previous and utf8.len(block.text) >= 2
+            and (block.share >= FREEZE_SHARE or block.age >= STABLE_SYLLABLES)
+        if same_input or settled then
+            lines[#lines + 1] = string.format("%s:%s:%s:s:%s\n", block.from, block.to, block.key, block.text)
+        end
+    end
+    return table.concat(lines)
+end
+
+-- 新树里每块稳定了几个音节：和上一次同位置同文字的块接着数，打完一个音节加一。
+local function block_ages(previous, step)
+    local ages = {}
+    for _, block in ipairs(previous) do
+        ages[block.from .. ":" .. block.to .. ":" .. block.text] = block.age + step
+    end
+    return ages
+end
+
+-- 返回 nova_tree 属性，以及要替换首选时的新候选。
+local function build_tree(env, tokens, seg, cand, stop)
+    local context = env.engine.context
+    local offsets = token_offsets(tokens)
+    local same_input = context:get_property("nova_tree_input") == context.input
+    local previous = previous_blocks(context:get_property("nova_tree") or "")
+    local frozen = frozen_lines(previous, same_input or stop ~= seg._end)
+    local pins = parse_pins(env, tokens, offsets, context.input:sub(seg._start + 1, seg._end), frozen)
+    local default_text = utf8.len(cand.text) == #tokens and cand.text or nil
+    local blocks = build_blocks(env, tokens, pins, default_text)
+    if not blocks then return nil end
+    local focus = focused_index(env, blocks, offsets, context.input)
+    -- 没打完的字母不算，只在多了完整音节时加一。
+    local grew = not same_input and stop == seg._end
+    local tree = serialize(env, blocks, tokens, offsets, focus, block_ages(previous, grew and 1 or 0))
+    if not (next(pins) or env.tree_debug or top_text(blocks) ~= cand.text) then return tree end
+    -- 候选只覆盖完整音节，没打完的字母留在输入框里。
+    local replacement = Candidate("sentence", seg._start, stop, top_text(blocks), env.tree_debug and tree or "")
+    replacement.preedit = cand.preedit
+    return tree, replacement
+end
+
 local function init(env)
     env.translator = Component.Translator(env.engine, "", "script_translator@translator")
-    env.cache, env.cache_size = {}, 0
+    env.cache, env.cache_size, env.weights = {}, 0, {}
     env.word_penalty = env.engine.schema.config:get_double("nova_sentences/word_penalty") or 0.0
     env.tree_enabled = env.engine.schema.config:get_bool("nova_tree/enabled") or false
     env.tree_debug = env.engine.schema.config:get_bool("nova_tree/debug") or false
@@ -249,7 +455,9 @@ end
 local function func(input, env)
     local composition = env.engine.context.composition
     local seg = not composition:empty() and composition:back() or nil
-    local tokens = seg and syllables(env.engine.context.input:sub(seg._start + 1, seg._end))
+    local tokens, pending
+    if seg then tokens, pending = syllables(env.engine.context.input:sub(seg._start + 1, seg._end)) end
+    local stop = seg and seg._end - #(pending or "")
     local context = env.engine.context
     local first = true
     local pinned = false
@@ -257,22 +465,24 @@ local function func(input, env)
         local shown = cand
         if first and env.tree_enabled then
             local tree = ""
-            if tokens and #tokens >= 2 then
-                local offsets = token_offsets(tokens)
-                local pins = parse_pins(env, tokens, offsets, context.input:sub(seg._start + 1, seg._end))
-                local default_text = utf8.len(cand.text) == #tokens and cand.text or nil
-                local blocks = (next(pins) or default_text) and build_blocks(env, tokens, pins, default_text)
-                if blocks then
-                    tree = serialize(blocks, tokens, offsets)
-                    pinned = next(pins) ~= nil
-                    if pinned or env.tree_debug then
-                        shown = Candidate("sentence", seg._start, seg._end, top_text(blocks),
-                                          env.tree_debug and tree or "")
-                        shown.preedit = cand.preedit
-                    end
+            if tokens and #tokens >= 1 then
+                -- 树出错时退回普通列表，不能让候选消失。
+                local ok, result, replacement = pcall(build_tree, env, tokens, seg, cand, stop)
+                if ok and result then
+                    tree = result
+                    pinned = next(parse_pins(env, tokens, token_offsets(tokens), context.input:sub(seg._start + 1, seg._end))) ~= nil
+                    shown = replacement or cand
+                elseif not ok then
+                    log.error("nova_sentences: " .. tostring(result))
                 end
             end
+            -- 只打了一个字母：还没有词块，面板不显示，输入框里也只留这个字母。
+            if tokens and #tokens == 0 then
+                tree = "\n"
+                shown = Candidate("raw", seg._start, seg._end, pending, "")
+            end
             context:set_property("nova_tree", tree)
+            context:set_property("nova_tree_input", context.input)
         end
         yield(shown)
         -- 固定之后只剩这一条整句，别的候选和固定段无关。
@@ -284,7 +494,7 @@ local function func(input, env)
                 for _, path in ipairs(sentences(env, tokens)) do
                     -- 词库里有多于音节数的词条（喜欢你），它们不是这串按键的整句。
                     if path[1] ~= cand.text and utf8.len(path[1]) == #tokens then
-                        local extra = Candidate("sentence", seg._start, seg._end, path[1], "")
+                        local extra = Candidate("sentence", seg._start, stop, path[1], "")
                         extra.preedit = cand.preedit
                         yield(extra)
                         added = added + 1

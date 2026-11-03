@@ -35,11 +35,20 @@ struct SquirrelApp {
           return true
 #if DEBUG
         case "--tree-preview":
-          // 开发用：把一段 nova_tree 画成 PNG，不经过输入法。
+          // 开发用：把一段 nova_tree 画成 PNG，不经过输入法。工程没定义 DEBUG，构建时要加
+          // SWIFT_ACTIVE_COMPILATION_CONDITIONS=DEBUG；否则这个参数会把程序当输入法启动。
           _ = NSApplication.shared
-          let panel = SquirrelPanel(position: .zero)
-          panel.tree = args[2].replacingOccurrences(of: "\\n", with: "\n").replacingOccurrences(of: "\\t", with: "\t")
-          panel.update(preedit: args[3], selRange: .empty, caretPos: 0, candidates: ["x"], comments: [""], labels: [], highlighted: 0, page: 0, lastPage: true, update: true)
+          let panel = NovaPanel()
+          let environment = ProcessInfo.processInfo.environment
+          // 屏幕中间的光标，默认往下长。
+          panel.position = NSRect(x: 200, y: 500, width: 1, height: 20)
+          panel.prepareForPreview(upward: environment["NOVA_PREVIEW_UP"] != nil, showShare: environment["NOVA_PREVIEW_SHARE"] != nil)
+          var content = NovaContent()
+          content.blocks = NovaBlock.parse(tree: args[2].replacingOccurrences(of: "\\n", with: "\n").replacingOccurrences(of: "\\t", with: "\t"))
+          content.preedit = args[3]
+          content.candidates = args[2].isEmpty ? args[3].map { NovaCandidate(label: "1", text: String($0), comment: "") } : [NovaCandidate(label: "", text: "x", comment: "")]
+          if !args[2].isEmpty { content.preedit = "" }
+          panel.update(content)
           if let view = panel.contentView, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
             view.cacheDisplay(in: view.bounds, to: rep)
             try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: args[4]))
