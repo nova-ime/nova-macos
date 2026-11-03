@@ -111,12 +111,14 @@ end
 --   标记末尾的 a数字 是这块已经稳定了几个音节，见 frozen_lines。
 --   标记：首字符 1 表示用户选过，0 表示没有；含 f 是焦点块；含 c 是整句解码选了词频较低的词；
 --   含 o 是没有焦点时直接显示备选的不确定块，数字键从左到右连续编号。
---   文字：`文字\31比例`；备选：`文字\31比例\31止`，长度可以和块不同。
+--   文字：`文字\31比例`；备选：`文字\31比例\31止[\31起]`，长度可以和块不同；带起点的是只换光标处
+--   一个字的单字备选（起点在块中间）。
 --   比例是在同段候选里占的词频比例，不是真实概率，可以为空。
 -- nova_pins 属性：每个固定段一行，`起:止:键:h|s:文字`。h 是用户选的；s 是选词时冻结的其他块，
 --   这样改一处不会让别处重新解码。
 -- nova_pins_end 属性：选词时的输入长度，见 parse_pins。
--- nova_focus 属性：`起:输入`。空或输入变了就是没有焦点。
+-- nova_cursor 属性：原始字母光标在整个输入里的位置，空表示在末尾。光标所在的块是焦点，
+--   在末尾时没有焦点。Rime 自己的光标始终在末尾，见 nova_tree_keys。
 
 local MAX_BLOCK_SYLLABLES = 3  -- 词库有「我很喜欢」这样的短语，块太长就没有东西可选
 local MAX_ALTS = 6
@@ -259,8 +261,27 @@ local function build_blocks(env, tokens, pins, default_text)
 end
 
 -- 焦点块的备选：先放同样长度的词，再每种长度放一个，用来重新切分。
-local function alternatives(env, tokens, offsets, block)
+-- 光标停在多字词里的某个字上时，先列这个字的同音单字：只换这一个字，词里其他字不动。
+-- 备选带上起点，和块的起点不同，nova_tree_keys 据此只固定这个字。
+local MAX_CHAR_ALTS = 4
+
+local function char_alternatives(env, tokens, offsets, block, k, result)
+    local current = char_sub(block.text, k - block.first + 1, k - block.first + 1)
+    local weights = span_weights(env, tokens[k], 1)
+    for _, word in ipairs(words_from(env, tokens, k)[1] or {}) do
+        if #result >= MAX_CHAR_ALTS then break end
+        if word[1] ~= current and utf8.len(word[1]) == 1 then
+            result[#result + 1] = { text = word[1], from = offsets[k], to = offsets[k] + #tokens[k],
+                                    share = share_of(weights, word[1]) }
+        end
+    end
+end
+
+local function alternatives(env, tokens, offsets, block, cursor_syllable)
     local result, seen = {}, { [block.text] = true }
+    if cursor_syllable and block.last > block.first then
+        char_alternatives(env, tokens, offsets, block, cursor_syllable, result)
+    end
     local by_length = words_from(env, tokens, block.first)
     local function add(length, limit)
         local last = block.first + length - 1
@@ -285,12 +306,63 @@ local function alternatives(env, tokens, offsets, block)
     return result
 end
 
-local function focused_index(env, blocks, offsets, input)
-    local from, text = (env.engine.context:get_property("nova_focus") or ""):match("^(%d+):(.*)$")
-    if text == input then
-        from = tonumber(from)
-        for i, block in ipairs(blocks) do
-            if offsets[block.last] >= from then return i end
+-- key 这段编码下长度为 want 的词，按翻译器的顺序，最多 limit 个。翻页时用，比 words_from 深。
+local function span_words(env, key, want, limit)
+    local words = {}
+    local seg = Segment(0, #key)
+    seg.tags = Set { "abc" }
+    local translation = env.translator:query(key, seg)
+    if translation then
+        local nxt, this = translation:iter()
+        for _ = 1, limit * 3 do
+            local cand = nxt(this)
+            if not cand or #words >= limit then break end
+            if cand._end == #key and cand.type ~= "sentence" and utf8.len(cand.text) == want then
+                words[#words + 1] = cand.text
+            end
+        end
+    end
+    return words
+end
+
+local PAGE_LIMIT = 36  -- 翻页时最多列多少个备选
+
+-- 焦点块的全部备选：第一页同原来（单字、同长度、别的长度），后面接更多的单字和同长度词。
+local function all_alternatives(env, tokens, offsets, block, cursor_syllable)
+    local result = alternatives(env, tokens, offsets, block, cursor_syllable)
+    local seen = { [block.text] = true }
+    for _, alt in ipairs(result) do seen[alt.text .. ":" .. (alt.from or "")] = true end
+    local function more(first, last, from, list)
+        for _, text in ipairs(list) do
+            if #result >= PAGE_LIMIT then return end
+            local id = text .. ":" .. (from or "")
+            if not seen[id] and text ~= block.text then
+                seen[id] = true
+                result[#result + 1] = { text = text, from = from, to = offsets[last] + #tokens[last] }
+            end
+        end
+    end
+    local length = block.last - block.first + 1
+    if cursor_syllable and length > 1 then
+        local current = char_sub(block.text, cursor_syllable - block.first + 1, cursor_syllable - block.first + 1)
+        local chars = {}
+        for _, text in ipairs(span_words(env, tokens[cursor_syllable], 1, PAGE_LIMIT)) do
+            if text ~= current then chars[#chars + 1] = text end
+        end
+        more(cursor_syllable, cursor_syllable, offsets[cursor_syllable], chars)
+    end
+    more(block.first, block.last, nil, span_words(env, table.concat(tokens, "", block.first, block.last), length, PAGE_LIMIT))
+    return result
+end
+
+-- 光标前一个字母所在的块和音节（光标在开头时取第一个字母）。没有焦点或在没打完的字母上时返回 nil。
+local function focused_index(env, blocks, offsets, tokens, seg)
+    local cursor = tonumber(env.engine.context:get_property("nova_cursor") or "")
+    if not cursor then return nil end
+    cursor = math.max(cursor - seg._start - 1, 0)
+    for i, block in ipairs(blocks) do
+        for k = block.first, block.last do
+            if cursor >= offsets[k] and cursor < offsets[k] + #tokens[k] then return i, k end
         end
     end
     return nil
@@ -341,7 +413,29 @@ local function pick_overview(env, blocks, tokens, offsets)
     end
 end
 
-local function serialize(env, blocks, tokens, offsets, focus, ages)
+-- ↓/↑ 换词中时返回开始换词时记下的备选列表和当前序号（0 是原来的词），否则返回 nil。
+local function cycling_list(env)
+    local context = env.engine.context
+    local index, signature = (context:get_property("nova_cycle") or ""):match("^(%d+):(.*)$")
+    local cursor = tonumber(context:get_property("nova_cursor") or "") or #context.input
+    if signature ~= cursor .. ":" .. context.input then return nil end
+    local list = {}
+    for from, to, text in (context:get_property("nova_cycle_alts") or ""):gmatch("(%d+):(%d+):([^\n]*)\n") do
+        list[#list + 1] = { from = tonumber(from), to = tonumber(to), text = text }
+    end
+    return list, tonumber(index)
+end
+
+-- nova_alt_page 属性：`页码:光标:输入`，光标或输入变了就是第一页。见 nova_tree_keys 的 turn_page。
+local function page_of(env)
+    local context = env.engine.context
+    local page, signature = (context:get_property("nova_alt_page") or ""):match("^(%d+):(.*)$")
+    local cursor = tonumber(context:get_property("nova_cursor") or "") or #context.input
+    if signature ~= cursor .. ":" .. context.input then return 0 end
+    return tonumber(page) or 0
+end
+
+local function serialize(env, blocks, tokens, offsets, focus, ages, cursor_syllable)
     for _, block in ipairs(blocks) do measure_block(env, block, tokens) end
     pick_overview(env, blocks, tokens, offsets)
     local lines = {}
@@ -354,9 +448,33 @@ local function serialize(env, blocks, tokens, offsets, focus, ages)
         flags = flags .. "a" .. (ages[from .. ":" .. to .. ":" .. block.text] or 0)
         local fields = { flags, tostring(offsets[block.first]), tostring(offsets[block.last] + #tokens[block.last]),
                          block.key, field(block.text, block.share) }
-        local alts = i == focus and alternatives(env, tokens, offsets, block) or block.overview or {}
+        local alts = block.overview or {}
+        if i == focus then
+            -- 焦点块的备选按页给出，每页 MAX_ALTS 个；页码越界时收到最后一页。
+            -- ↓/↑ 换词时（nova_cycle 对得上）显示开始换词时记下的列表，当前用的那项高亮，页码跟着它走。
+            local all, current = cycling_list(env)
+            if not all then
+                all = all_alternatives(env, tokens, offsets, block, cursor_syllable)
+                local lines = {}
+                for _, alt in ipairs(all) do
+                    lines[#lines + 1] = string.format("%d:%d:%s\n", alt.from or from, alt.to, alt.text)
+                end
+                env.engine.context:set_property("nova_focus_alts", table.concat(lines))
+            end
+            local pages = math.max(1, math.ceil(#all / MAX_ALTS))
+            local page = current and current > 0 and math.floor((current - 1) / MAX_ALTS) or math.min(page_of(env), pages - 1)
+            alts = {}
+            for j = page * MAX_ALTS + 1, math.min(#all, (page + 1) * MAX_ALTS) do
+                local alt = all[j]
+                -- 都带上起点：换词后焦点块可能变了，数字键要按备选自己的范围固定。
+                alts[#alts + 1] = { text = alt.text, share = alt.share, to = alt.to, from = alt.from or from }
+            end
+            fields[1] = flags
+            if pages > 1 then fields[1] = fields[1] .. "p" .. (page + 1) .. "/" .. pages end
+            if current and current > 0 then fields[1] = fields[1] .. "h" .. ((current - 1) % MAX_ALTS + 1) end
+        end
         for _, alt in ipairs(alts) do
-            fields[#fields + 1] = field(alt.text, alt.share, alt.to)
+            fields[#fields + 1] = alt.from and field(alt.text, alt.share, alt.to, alt.from) or field(alt.text, alt.share, alt.to)
         end
         lines[#lines + 1] = table.concat(fields, "\t")
     end
@@ -433,10 +551,10 @@ local function build_tree(env, tokens, seg, cand, stop)
     local default_text = utf8.len(cand.text) == #tokens and cand.text or nil
     local blocks = build_blocks(env, tokens, pins, default_text)
     if not blocks then return nil end
-    local focus = focused_index(env, blocks, offsets, context.input)
+    local focus, cursor_syllable = focused_index(env, blocks, offsets, tokens, seg)
     -- 没打完的字母不算，只在多了完整音节时加一。
     local grew = not same_input and stop == seg._end
-    local tree = serialize(env, blocks, tokens, offsets, focus, block_ages(previous, grew and 1 or 0))
+    local tree = serialize(env, blocks, tokens, offsets, focus, block_ages(previous, grew and 1 or 0), cursor_syllable)
     if not (next(pins) or env.tree_debug or top_text(blocks) ~= cand.text) then return tree end
     -- 候选只覆盖完整音节，没打完的字母留在输入框里。
     local replacement = Candidate("sentence", seg._start, stop, top_text(blocks), env.tree_debug and tree or "")
