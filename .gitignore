@@ -20,6 +20,7 @@ package/*.xml
 .*.swp
 .DS_Store
 build-release/
+build-debug/
 Squirrel-*-official.app/
 official-pkg/
 SharedSupport-removed-from-official/
