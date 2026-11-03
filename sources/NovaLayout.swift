@@ -20,6 +20,9 @@ struct NovaChoice: Equatable {
 }
 
 struct NovaBlock: Equatable {
+  // 这块在原始字母里的范围（字节偏移，原始字母都是 ASCII，也就是第几个字母）。
+  let from: Int
+  let to: Int
   let pinned: Bool
   let focused: Bool
   let corrected: Bool
@@ -27,15 +30,22 @@ struct NovaBlock: Equatable {
   let overview: Bool
   let word: NovaChoice
   let alternatives: [NovaChoice]
+  // 焦点块的备选分页时的「第几页/共几页」，不分页时为空。
+  let page: String
+  // ↓/↑ 换词时当前用的是这一页的第几个备选（从 1 起），没有时为空。
+  let current: Int?
 
   // nova_tree 属性：每块一行，格式见 nova_sentences.lua。
   static func parse(tree: String) -> [NovaBlock] {
     tree.split(separator: "\n").map { line in
       let fields = line.split(separator: "\t").map(String.init)
       let flags = fields.first ?? ""
-      return NovaBlock(pinned: flags.hasPrefix("1"), focused: flags.contains("f"), corrected: flags.contains("c"), overview: flags.contains("o"),
+      return NovaBlock(from: fields.count > 1 ? Int(fields[1]) ?? 0 : 0, to: fields.count > 2 ? Int(fields[2]) ?? 0 : 0,
+                       pinned: flags.hasPrefix("1"), focused: flags.contains("f"), corrected: flags.contains("c"), overview: flags.contains("o"),
                        word: NovaChoice(field: fields.count > 4 ? fields[4] : ""),
-                       alternatives: fields.dropFirst(5).map(NovaChoice.init(field:)))
+                       alternatives: fields.dropFirst(5).map(NovaChoice.init(field:)),
+                       page: flags.range(of: #"p\d+/\d+"#, options: .regularExpression).map { String(flags[$0].dropFirst()) } ?? "",
+                       current: flags.range(of: #"h\d+"#, options: .regularExpression).flatMap { Int(flags[$0].dropFirst()) })
     }
   }
 
@@ -65,6 +75,9 @@ struct NovaContent {
   // 无效范围表示整行都是正文（状态消息），有效范围表示其余部分是已转换或未选中的输入。
   var selRange = NSRange.empty
   var blocks = [NovaBlock]()
+  // 原始字母和光标位置（第几个字母之前）。空表示不显示字母行。
+  var letters = ""
+  var cursor = 0
   var candidates = [NovaCandidate]()
   var highlighted = 0
 }
@@ -84,6 +97,8 @@ enum NovaAction: Equatable {
   // 第几个备选（从 1 起），和数字键同一个编号。
   case pin(Int)
   case focus(Int)
+  // 把原始字母光标移到第几个字母之前。
+  case cursor(Int)
 }
 
 // 全部是实色，没有透明度和描边。
@@ -161,7 +176,10 @@ struct NovaLayout {
     if content.blocks.isEmpty {
       addCandidates(content, maxWidth: maxWidth)
     } else {
+      // 字母行贴着输入的文字：面板在下方时放最上面，在上方时放最下面。
+      if !upward { addLetters(content) }
       addTree(content.blocks, maxWidth: maxWidth)
+      if upward { addLetters(content) }
     }
     size = NSSize(width: ceil(right) + Self.edge, height: ceil(bottom) + Self.edge)
   }
@@ -233,6 +251,39 @@ private extension NovaLayout {
     if !content.blocks.isEmpty || !content.candidates.isEmpty {
       bottom += 6
     }
+  }
+
+  var letterFont: NSFont { .monospacedSystemFont(ofSize: round(style.font.pointSize * 0.9), weight: .regular) }
+
+  // 原始字母一行：每块的字母下面画一条和词块同色的线，焦点块是黄色；光标是一根黄色竖线。
+  // 点一个字母，光标移到它前面。
+  mutating func addLetters(_ content: NovaContent) {
+    guard !content.letters.isEmpty else { return }
+    if upward { bottom += 6 }
+    let letters = Array(content.letters)
+    let width = ceil(string("m", letterFont, NovaPalette.primary).size().width)
+    let rect = NSRect(x: Self.edge + Self.chipPadding, y: bottom, width: width * CGFloat(letters.count), height: rowHeight)
+    let line = baseline(of: rect, font: letterFont)
+    // 字母是白色，铺一块深色底，在浅色窗口上也看得见。
+    boxes.append(Box(rect: rect.insetBy(dx: -Self.chipPadding, dy: 0), radius: Self.chipRadius, color: NovaPalette.altFill))
+    let covered = Set(content.blocks.flatMap { Array($0.from..<max($0.from, $0.to)) })
+    for (index, letter) in letters.enumerated() {
+      let x = rect.minX + CGFloat(index) * width
+      runs.append(Run(string: string(String(letter), letterFont, covered.contains(index) ? NovaPalette.primary : NovaPalette.dim),
+                      x: x, baseline: line))
+      // 光标落在点的字母后面：焦点按光标前一个字母算。
+      hits.append(Hit(rect: NSRect(x: x, y: rect.minY, width: width, height: rect.height), action: .cursor(index + 1)))
+    }
+    for block in content.blocks where block.to > block.from {
+      let x = rect.minX + CGFloat(block.from) * width
+      boxes.append(Box(rect: NSRect(x: x + 1, y: rect.maxY - 5, width: CGFloat(block.to - block.from) * width - 2, height: 2),
+                       radius: 0, color: block.focused ? NovaPalette.focus : block.color))
+    }
+    let cursorX = rect.minX + CGFloat(min(max(content.cursor, 0), letters.count)) * width
+    boxes.append(Box(rect: NSRect(x: cursorX - 1, y: rect.minY + 3, width: 2, height: rect.height - 6), radius: 1, color: NovaPalette.focus))
+    right = max(right, rect.maxX + Self.chipPadding)
+    bottom += rowHeight
+    if !upward { bottom += 6 }
   }
 
   // 词块只按自身宽度排在一条连线上，放不下时另起一排。
@@ -329,7 +380,8 @@ private extension NovaLayout {
       let distance = firstRow + CGFloat(row) * altRowHeight
       let rect = tier.rect(x: cellX, distance: distance, width: width, height: altHeight)
       addBranch(spine: spine, from: bus, toX: cellX, y: rect.midY)
-      boxes.append(Box(rect: rect, radius: 5, color: NovaPalette.altFill))
+      // ↓/↑ 换上的那一项铺蓝色，和普通列表的高亮一样。
+      boxes.append(Box(rect: rect, radius: 5, color: column.block.current == row + 1 ? NovaPalette.blue : NovaPalette.altFill))
       hits.append(Hit(rect: rect, action: .pin(column.firstLabel + row)))
       let line = baseline(of: rect, font: style.font)
       var cursor = cellX + Self.altPadding
@@ -341,6 +393,13 @@ private extension NovaLayout {
         let shareRect = tier.rect(x: cellX, distance: distance + altHeight, width: width, height: shareHeight)
         runs.append(Run(string: share, x: rect.midX - ceil(share.size().width) / 2, baseline: baseline(of: shareRect, font: style.shareFont)))
       }
+    }
+    // 分页时在最后一个备选右边标出页码，-/= 或 ,/. 翻页。
+    if !column.block.page.isEmpty, let last = column.cells.indices.last {
+      let rect = tier.rect(x: cellX, distance: firstRow + CGFloat(last) * altRowHeight, width: width, height: altHeight)
+      let page = string("‹ \(column.block.page) ›", style.labelFont, NovaPalette.dim)
+      runs.append(Run(string: page, x: cellX + width + Self.altGap, baseline: baseline(of: rect, font: style.labelFont)))
+      right = max(right, cellX + width + Self.altGap + ceil(page.size().width))
     }
     right = max(right, cellX + width)
     altFloor = cellX + width + Self.altGap

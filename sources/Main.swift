@@ -48,6 +48,9 @@ struct SquirrelApp {
           content.preedit = args[3]
           content.candidates = args[2].isEmpty ? args[3].map { NovaCandidate(label: "1", text: String($0), comment: "") } : [NovaCandidate(label: "", text: "x", comment: "")]
           if !args[2].isEmpty { content.preedit = "" }
+          // 原始字母行：NOVA_PREVIEW_LETTERS=字母，NOVA_PREVIEW_CURSOR=光标位置。
+          content.letters = environment["NOVA_PREVIEW_LETTERS"] ?? ""
+          content.cursor = Int(environment["NOVA_PREVIEW_CURSOR"] ?? "") ?? content.letters.count
           panel.update(content)
           if let view = panel.contentView, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
             view.cacheDisplay(in: view.bounds, to: rep)

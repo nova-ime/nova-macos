@@ -140,12 +140,27 @@ final class SquirrelInputController: IMKInputController {
     }
   }
 
-  // 和 ←/→ 走同一条路，由 nova_tree_keys.lua 处理。
-  func moveFocus(by step: Int) {
-    for _ in 0..<abs(step) {
-      _ = rimeAPI.process_key(session, Int32(step < 0 ? XK_Left : XK_Right), 0)
+  // 点击字母或词块：改原始字母光标，再发 F20 让 nova_tree_keys.lua 按新光标重画树。
+  func moveCursor(to position: Int) {
+    rimeAPI.set_property(session, "nova_cursor", "\(position)")
+    if rimeAPI.process_key(session, Int32(XK_F20), 0) {
+      rimeUpdate()
     }
-    rimeUpdate()
+  }
+
+  // 滚轮翻焦点块的备选，和 PageUp/PageDown 走同一条路，由 nova_tree_keys.lua 处理。
+  func turnAlternativePage(up: Bool) {
+    if rimeAPI.process_key(session, Int32(up ? XK_Page_Up : XK_Page_Down), 0) {
+      rimeUpdate()
+    }
+  }
+
+  // 原始字母光标，nova_cursor 属性为空时在末尾。
+  func rawCursor(inputLength: Int) -> Int {
+    var buffer = [CChar](repeating: 0, count: 32)
+    guard rimeAPI.get_property(session, "nova_cursor", &buffer, buffer.count),
+          let value = Int(String(cString: buffer)) else { return inputLength }
+    return min(max(value, 0), inputLength)
   }
 
   // swiftlint:disable:next identifier_name
@@ -452,6 +467,16 @@ private extension SquirrelInputController {
 
     var ctx = RimeContext_stdbool.rimeStructInit()
     if rimeAPI.get_context(session, &ctx) {
+      // 要在 get_context 之后读：nova_tree 由候选过滤器在生成菜单时写入。
+      var treeBuffer = [CChar](repeating: 0, count: 8192)
+      // 翻页或移动高亮是在找树上没有的候选，这时才显示普通列表。
+      let browsing = ctx.menu.page_no > 0 || ctx.menu.highlighted_candidate_index > 0
+      let hasTree = !browsing && rimeAPI.get_property(session, "nova_tree", &treeBuffer, treeBuffer.count) && ctx.menu.num_candidates > 0
+      let tree = hasTree ? String(cString: treeBuffer) : ""
+      // 有树时原始字母只画在面板里（带光标和按词块着色的下划线），输入框照常显示首选整句。
+      let letters = tree.isEmpty ? "" : rimeAPI.get_input(session).map { String(cString: $0) } ?? ""
+      let cursor = rawCursor(inputLength: letters.utf8.count)
+
       // update preedit text
       let preedit = ctx.composition.preedit.map({ String(cString: $0) }) ?? ""
 
@@ -535,17 +560,11 @@ private extension SquirrelInputController {
         }
       }
       // swiftlint:enable identifier_name
-      // 要在 get_context 之后读：nova_tree 由候选过滤器在生成菜单时写入。
-      var treeBuffer = [CChar](repeating: 0, count: 8192)
-      // 翻页或移动高亮是在找树上没有的候选，这时才显示普通列表。
-      let browsing = ctx.menu.page_no > 0 || ctx.menu.highlighted_candidate_index > 0
-      let hasTree = !browsing && rimeAPI.get_property(session, "nova_tree", &treeBuffer, treeBuffer.count) && numCandidates > 0
-      let tree = hasTree ? String(cString: treeBuffer) : ""
-
       let selRange = NSRange(location: start.utf16Offset(in: preedit), length: preedit.utf16.distance(from: start, to: end))
       // 空行表示还没有词块（只打了一个字母），这时什么都不显示。
-      showPanel(preedit: inlinePreedit ? "" : preedit, selRange: selRange, tree: tree,
-                candidates: tree == "\n" ? [] : candidates, comments: comments, labels: labels, highlighted: Int(ctx.menu.highlighted_candidate_index))
+      showPanel(preedit: inlinePreedit || !letters.isEmpty ? "" : preedit, selRange: selRange, tree: tree,
+                candidates: tree == "\n" ? [] : candidates, comments: comments, labels: labels, highlighted: Int(ctx.menu.highlighted_candidate_index),
+                letters: letters, cursor: cursor)
       _ = rimeAPI.free_context(&ctx)
     } else {
       hidePalettes()
@@ -585,7 +604,8 @@ private extension SquirrelInputController {
   }
 
   // swiftlint:disable:next function_parameter_count
-  func showPanel(preedit: String, selRange: NSRange, tree: String, candidates: [String], comments: [String], labels: [String], highlighted: Int) {
+  func showPanel(preedit: String, selRange: NSRange, tree: String, candidates: [String], comments: [String], labels: [String], highlighted: Int,
+                 letters: String = "", cursor: Int = 0) {
     guard let client = client, let panel = NSApp.squirrelAppDelegate.panel else { return }
     var inputPos = NSRect()
     client.attributes(forCharacterIndex: 0, lineHeightRectangle: &inputPos)
@@ -595,6 +615,8 @@ private extension SquirrelInputController {
     content.preedit = preedit
     content.selRange = selRange
     content.blocks = NovaBlock.parse(tree: tree)
+    content.letters = letters
+    content.cursor = cursor
     content.highlighted = highlighted
     content.candidates = candidates.indices.map { index in
       let label = index < labels.count ? labels[index] : "\(index + 1)"

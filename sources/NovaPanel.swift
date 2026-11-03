@@ -205,10 +205,12 @@ private extension NovaPanel {
     case .pin(let label):
       inputController?.pinAlternative(label)
     case .focus(let index):
-      // 没有焦点时相当于停在最后一块的后面，← 一次到最后一块。
-      if let blocks = shown?.blocks {
-        inputController?.moveFocus(by: index - (blocks.firstIndex(where: \.focused) ?? blocks.count))
+      // 点词块：光标移到这块的末尾，这块成为焦点。
+      if let blocks = shown?.blocks, index < blocks.count {
+        inputController?.moveCursor(to: blocks[index].to)
       }
+    case .cursor(let position):
+      inputController?.moveCursor(to: position)
     }
   }
 
@@ -219,7 +221,12 @@ private extension NovaPanel {
     }
     scrollDelta += event.scrollingDeltaY
     if abs(scrollDelta) >= (event.hasPreciseScrollingDeltas ? 30 : 1) {
-      _ = inputController?.page(up: scrollDelta > 0)
+      // 有焦点块时翻它的备选，否则翻普通候选列表。
+      if shown?.blocks.contains(where: \.focused) == true {
+        inputController?.turnAlternativePage(up: scrollDelta > 0)
+      } else {
+        _ = inputController?.page(up: scrollDelta > 0)
+      }
       scrollDelta = 0
     }
   }
