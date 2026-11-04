@@ -7,7 +7,8 @@
 -- 一直按 ↑ 回到原来的词，见 cycle。
 -- nova_cursor 为空表示没有焦点（光标在末尾，数字键直接选不确定块的备选，从左到右连续编号）；
 -- 等于输入长度表示光标也在末尾，但焦点在最后一块（Tab 跳到最后一块的末尾）。
--- 选词时其他块冻结，只有和所选范围重叠的部分重新解码。选的词覆盖整个输入时直接上屏。
+-- 选词时只冻结前面的块，所选范围和它后面的部分重新解码，后面的字可以跟新选的字组词
+-- （显 + 时期 → 显示器）；用户选过的块不管在哪都保留。选的词覆盖整个输入时直接上屏。
 -- 空格不管光标在哪都上屏整句；末尾有半个音节时上屏前面的完整部分，见 commit_before_pending。
 
 local LEFT, RIGHT, SPACE = 0xff51, 0xff53, 0x20
@@ -20,6 +21,7 @@ local REFRESH = 0xffd1
 local function clear(ctx)
     ctx:set_property("nova_pins", "")
     ctx:set_property("nova_pins_end", "")
+    ctx:set_property("nova_open_from", "")
     ctx:set_property("nova_tree", "")
     ctx:set_property("nova_tree_input", "")
     ctx:set_property("nova_cursor", "")
@@ -200,19 +202,18 @@ local function choose(env, seg, blocks, focus, chosen, alt)
     end
     local pins = { pin_line(input, from, alt.to, "h", alt.text) }
     for _, block in ipairs(blocks) do
-        if block.to <= from or block.from >= alt.to then
+        if block.to <= from or (block.chosen and block.from >= alt.to) then
             pins[#pins + 1] = pin_line(input, block.from, block.to, block.chosen and "h" or "s", block.text)
         end
     end
-    -- 同一个词里没换的字原样保留，词从这里拆开。
+    -- 同一个词里在它前面的字原样保留，词从这里拆开；后面的字跟着重新解码。
     if alt.from then
         local before = block_chars(input, chosen, chosen.from, from)
         if before then pins[#pins + 1] = pin_line(input, chosen.from, from, chosen.chosen and "h" or "s", before) end
-        local after = block_chars(input, chosen, alt.to, chosen.to)
-        if after then pins[#pins + 1] = pin_line(input, alt.to, chosen.to, chosen.chosen and "h" or "s", after) end
     end
     ctx:set_property("nova_pins", table.concat(pins))
     ctx:set_property("nova_pins_end", tostring(#input))
+    ctx:set_property("nova_open_from", from .. ":" .. ctx.input)
     ctx:set_property("nova_alt_page", "")
     ctx:set_property("nova_cycle", "")
     ctx:refresh_non_confirmed_composition()
@@ -271,9 +272,12 @@ local function cycle(env, seg, blocks, focus, step)
     local low, high = original.from, original.to
     if alt then low, high = math.min(low, alt.from), math.max(high, alt.to) end
     local pins = {}
-    -- 换成更长的词时，被它盖住的其他词让开。
-    for line, from, to in (ctx:get_property("nova_cycle_base") or ""):gmatch("((%d+):(%d+):[^\n]*\n)") do
-        if tonumber(to) <= low or tonumber(from) >= high then pins[#pins + 1] = line end
+    -- 前面的词冻结；后面的只留用户选过的，其余跟着换上的词重新解码。换成更长的词时，被它盖住的词让开。
+    -- 回到原来的词时其他词全部照原样放回。
+    for line, from, to, other in (ctx:get_property("nova_cycle_base") or ""):gmatch("((%d+):(%d+):[^:]*:([hs]):[^\n]*\n)") do
+        if tonumber(to) <= low or (tonumber(from) >= high and (other == "h" or not alt)) then
+            pins[#pins + 1] = line
+        end
     end
     if not alt then
         pins[#pins + 1] = pin_line(input, original.from, original.to, kind, original.text)
@@ -284,13 +288,10 @@ local function cycle(env, seg, blocks, focus, step)
             local before = block_chars(input, original, original.from, alt.from)
             if before then pins[#pins + 1] = pin_line(input, original.from, alt.from, "s", before) end
         end
-        if alt.to < original.to then
-            local after = block_chars(input, original, alt.to, original.to)
-            if after then pins[#pins + 1] = pin_line(input, alt.to, original.to, "s", after) end
-        end
     end
     ctx:set_property("nova_pins", table.concat(pins))
     ctx:set_property("nova_pins_end", tostring(#input))
+    ctx:set_property("nova_open_from", alt and (low .. ":" .. ctx.input) or "")
     ctx:set_property("nova_cycle", index .. ":" .. signature)
     ctx:set_property("nova_alt_page", "")
     ctx:refresh_non_confirmed_composition()

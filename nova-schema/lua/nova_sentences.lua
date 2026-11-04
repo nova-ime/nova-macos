@@ -81,7 +81,8 @@ local function best_paths(extensions)
     return result
 end
 
-local function sentences(env, tokens)
+-- prefix 不为空时只留和它一致的路径：开头这几个字固定，词可以从它们跨到后面（显 + 示器）。
+local function sentences(env, tokens, prefix)
     local n = #tokens
     local pending = {}
     for i = 1, n do pending[i] = {} end
@@ -93,7 +94,10 @@ local function sentences(env, tokens)
                 local bucket = pending[first + length - 1]
                 for _, word in ipairs(words) do
                     for _, path in ipairs(starts) do
-                        bucket[#bucket + 1] = { path[1] .. word[1], path[2] + word[2] - env.word_penalty }
+                        local text = path[1] .. word[1]
+                        if not prefix or prefix:sub(1, #text) == text or text:sub(1, #prefix) == prefix then
+                            bucket[#bucket + 1] = { text, path[2] + word[2] - env.word_penalty }
+                        end
                     end
                 end
             end
@@ -114,9 +118,10 @@ end
 --   文字：`文字\31比例`；备选：`文字\31比例\31止[\31起]`，长度可以和块不同；带起点的是只换光标处
 --   一个字的单字备选（起点在块中间）。
 --   比例是在同段候选里占的词频比例，不是真实概率，可以为空。
--- nova_pins 属性：每个固定段一行，`起:止:键:h|s:文字`。h 是用户选的；s 是选词时冻结的其他块，
---   这样改一处不会让别处重新解码。
+-- nova_pins 属性：每个固定段一行，`起:止:键:h|s:文字`。h 是用户选的；s 是选词时冻结的前文，
+--   这样改一处不会让前面的词重新解码；后面的词跟着新选的字重新解码。
 -- nova_pins_end 属性：选词时的输入长度，见 parse_pins。
+-- nova_open_from 属性：`起点:输入`，刚选的词在段内的起点。它后面的块不冻结，见 frozen_lines。
 -- nova_cursor 属性：原始字母光标在整个输入里的位置，空表示在末尾。光标所在的块是焦点，
 --   在末尾时没有焦点。Rime 自己的光标始终在末尾，见 nova_tree_keys。
 
@@ -155,6 +160,34 @@ local function decode(env, tokens, first, last)
     for i = first, last do sub[#sub + 1] = tokens[i] end
     for _, path in ipairs(sentences(env, sub)) do
         if utf8.len(path[1]) == want then return path[1] end
+    end
+    return nil
+end
+
+-- 解码 tokens[first..last]，开头必须是 prefix（前面固定段的字），返回 prefix 后面的部分。
+-- 改了前面的字，后面要跟着它重新组词：只解后面这段看不到它，整句首选又没带上它。
+local function decode_after(env, tokens, first, last, prefix)
+    local key = table.concat(tokens, "", first, last)
+    local want = last - first + 1
+    local seg = Segment(0, #key)
+    seg.tags = Set { "abc" }
+    local translation = env.translator:query(key, seg)
+    if translation then
+        local nxt, this = translation:iter()
+        for _ = 1, 100 do
+            local cand = nxt(this)
+            if not cand then break end
+            if cand._end == #key and utf8.len(cand.text) == want and cand.text:sub(1, #prefix) == prefix then
+                return cand.text:sub(#prefix + 1)
+            end
+        end
+    end
+    local sub = {}
+    for i = first, last do sub[#sub + 1] = tokens[i] end
+    for _, path in ipairs(sentences(env, sub, prefix)) do
+        if utf8.len(path[1]) == want and path[1]:sub(1, #prefix) == prefix then
+            return path[1]:sub(#prefix + 1)
+        end
     end
     return nil
 end
@@ -242,17 +275,27 @@ end
 local function build_blocks(env, tokens, pins, default_text)
     local blocks, n, i = {}, #tokens, 1
     local has_pin = next(pins) ~= nil
+    local before -- 紧挨在前面的固定段
     while i <= n do
         if pins[i] then
             blocks[#blocks + 1] = { pinned = pins[i].chosen, first = i, last = pins[i].last, text = pins[i].text }
+            before = { first = i, text = pins[i].text }
             i = pins[i].last + 1
         else
             local stop = i
             while stop < n and not pins[stop + 1] do stop = stop + 1 end
             -- 优先取整句首选里对应的字，它带着前后文；首选字数对不上音节时（词库里的「喜欢你」）
-            -- 才单独解码这一段。
-            local text = default_text and char_sub(default_text, i, stop) or decode(env, tokens, i, stop)
+            -- 才单独解码这一段。首选和前面的固定段对不上时（用户改了那里的字），
+            -- 带着固定段一起解码，后面的字才能跟它组词。
+            local text
+            if default_text and not (before and char_sub(default_text, before.first, i - 1) ~= before.text) then
+                text = char_sub(default_text, i, stop)
+            elseif before then
+                text = decode_after(env, tokens, before.first, stop, before.text)
+            end
+            text = text or decode(env, tokens, i, stop)
             if not text then return nil end
+            before = nil
             split_blocks(env, tokens, i, stop, text, blocks)
             i = stop + 1
         end
@@ -519,12 +562,14 @@ local function previous_blocks(previous)
     return blocks
 end
 
-local function frozen_lines(previous, same_input)
+-- open_from 是刚选的词的起点：只冻结它前面的块，后面的跟着新选的字重新解码。
+local function frozen_lines(previous, same_input, open_from)
     local lines = {}
     for i, block in ipairs(previous) do
         local settled = i < #previous and utf8.len(block.text) >= 2
             and (block.share >= FREEZE_SHARE or block.age >= STABLE_SYLLABLES)
-        if same_input or settled then
+        local opened = open_from and tonumber(block.to) > open_from
+        if (same_input or settled) and not opened then
             lines[#lines + 1] = string.format("%s:%s:%s:s:%s\n", block.from, block.to, block.key, block.text)
         end
     end
@@ -546,7 +591,10 @@ local function build_tree(env, tokens, seg, cand, stop)
     local offsets = token_offsets(tokens)
     local same_input = context:get_property("nova_tree_input") == context.input
     local previous = previous_blocks(context:get_property("nova_tree") or "")
-    local frozen = frozen_lines(previous, same_input or stop ~= seg._end)
+    -- nova_open_from：`起点:输入`，nova_tree_keys 选词时写，输入变了就失效。
+    local open_from, open_input = (context:get_property("nova_open_from") or ""):match("^(%d+):(.*)$")
+    open_from = open_input == context.input and tonumber(open_from) or nil
+    local frozen = frozen_lines(previous, same_input or stop ~= seg._end, open_from)
     local pins = parse_pins(env, tokens, offsets, context.input:sub(seg._start + 1, seg._end), frozen)
     local default_text = utf8.len(cand.text) == #tokens and cand.text or nil
     local blocks = build_blocks(env, tokens, pins, default_text)
