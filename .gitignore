@@ -24,3 +24,4 @@ build-debug/
 Squirrel-*-official.app/
 official-pkg/
 SharedSupport-removed-from-official/
+.scratch/
