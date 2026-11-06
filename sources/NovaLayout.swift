@@ -26,6 +26,8 @@ struct NovaBlock: Equatable {
   let pinned: Bool
   let focused: Bool
   let corrected: Bool
+  // 换几个上下文窗口解码，这块的结果不一样：解码器拿不准，标橙。
+  let uncertain: Bool
   // 没有焦点时直接显示备选的不确定块。
   let overview: Bool
   let word: NovaChoice
@@ -41,7 +43,7 @@ struct NovaBlock: Equatable {
       let fields = line.split(separator: "\t").map(String.init)
       let flags = fields.first ?? ""
       return NovaBlock(from: fields.count > 1 ? Int(fields[1]) ?? 0 : 0, to: fields.count > 2 ? Int(fields[2]) ?? 0 : 0,
-                       pinned: flags.hasPrefix("1"), focused: flags.contains("f"), corrected: flags.contains("c"), overview: flags.contains("o"),
+                       pinned: flags.hasPrefix("1"), focused: flags.contains("f"), corrected: flags.contains("c"), uncertain: flags.contains("u"), overview: flags.contains("o"),
                        word: NovaChoice(field: fields.count > 4 ? fields[4] : ""),
                        alternatives: fields.dropFirst(5).map(NovaChoice.init(field:)),
                        page: flags.range(of: #"p\d+/\d+"#, options: .regularExpression).map { String(flags[$0].dropFirst()) } ?? "",
@@ -49,9 +51,7 @@ struct NovaBlock: Equatable {
     }
   }
 
-  // 比例低于这个值就算没把握，和 nova_sentences.lua 的 CONFIDENT_SHARE 一致。
-  private static let confidentShare = 80
-
+  // 绿：用户选过。紫：语法推翻了词频（多半是对的）。橙：解码器拿不准。见 nova_sentences.lua 的 measure_block。
   var color: NSColor {
     if pinned {
       return NovaPalette.green
@@ -59,8 +59,7 @@ struct NovaBlock: Equatable {
     if corrected {
       return NovaPalette.purple
     }
-    guard let share = word.share else { return NovaPalette.blue }
-    return share >= Self.confidentShare ? NovaPalette.blue : NovaPalette.orange
+    return uncertain ? NovaPalette.orange : NovaPalette.blue
   }
 }
 

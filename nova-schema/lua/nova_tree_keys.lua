@@ -48,17 +48,18 @@ end
 
 -- 输入在 at 处插入（delta=1）或删去 at 处的一个字母（delta=-1）后，固定段和上一次的树跟着平移：
 -- 整段在改动前的不动，整段在改动后的移一位，和改动重叠的作废（它的按键变了）。
-local function shift_range(from, to, at, delta)
-    if to <= at then return from, to end
+-- 在段的末尾插入大写辅助码（aux）也算改这段：用户是要用辅助码重新筛选这个字。
+local function shift_range(from, to, at, delta, aux)
+    if to < at or (to == at and not aux) then return from, to end
     local after = delta > 0 and at or at + 1
     if from >= after then return from + delta, to + delta end
     return nil
 end
 
-local function shift_properties(ctx, at, delta)
+local function shift_properties(ctx, at, delta, aux)
     local pins = {}
     for from, to, rest in (ctx:get_property("nova_pins") or ""):gmatch("(%d+):(%d+):([^\n]*)\n") do
-        local a, b = shift_range(tonumber(from), tonumber(to), at, delta)
+        local a, b = shift_range(tonumber(from), tonumber(to), at, delta, aux)
         if a then pins[#pins + 1] = string.format("%d:%d:%s\n", a, b, rest) end
     end
     ctx:set_property("nova_pins", table.concat(pins))
@@ -68,7 +69,7 @@ local function shift_properties(ctx, at, delta)
     for line in (ctx:get_property("nova_tree") or ""):gmatch("[^\n]+") do
         local flags, from, to, rest = line:match("^([^\t]*)\t(%d+)\t(%d+)\t(.*)$")
         if flags then
-            local a, b = shift_range(tonumber(from), tonumber(to), at, delta)
+            local a, b = shift_range(tonumber(from), tonumber(to), at, delta, aux)
             if a then lines[#lines + 1] = string.format("%s\t%d\t%d\t%s", flags, a, b, rest) end
         end
     end
@@ -79,7 +80,7 @@ end
 -- 在光标处插入 text，或删去光标前（before=true）/后的一个字母。只处理光标不在末尾的情形。
 local function insert_at_cursor(ctx, text)
     local input, cursor = ctx.input, cursor_of(ctx)
-    shift_properties(ctx, cursor, 1)
+    shift_properties(ctx, cursor, 1, text:match("^[A-Z]$") ~= nil)
     ctx:set_property("nova_cursor", tostring(cursor + 1))
     ctx:set_property("nova_alt_page", "")
     ctx.input = input:sub(1, cursor) .. text .. input:sub(cursor + 1)
