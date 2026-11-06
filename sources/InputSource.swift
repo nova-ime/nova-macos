@@ -41,12 +41,9 @@ final class SquirrelInstaller {
   }
 
   func register() {
-    let enabledInputModes = enabledModes()
-    if !enabledInputModes.isEmpty {
-      print("User already registered Squirrel method(s): \(enabledInputModes.map { $0.rawValue })")
-      // Already registered.
-      return
-    }
+    // 每次都按当前路径重新登记，不因为 ID 已经登记过就跳过：
+    // 换了安装位置（比如从 ~/Library 搬到 /Library）时，系统还记着旧路径，Nova 会选不上。
+    // 重复登记同一路径没有副作用。
     TISRegisterInputSource(SquirrelApp.appDir as CFURL)
     print("Registered input source from \(SquirrelApp.appDir)")
   }
@@ -89,6 +86,12 @@ final class SquirrelInstaller {
         print("Failed to select \(mode.rawValue)")
       }
     }
+  }
+
+  static func currentInputSourceID() -> String? {
+    let source = TISCopyCurrentKeyboardInputSource().takeRetainedValue()
+    let idRef = TISGetInputSourceProperty(source, kTISPropertyInputSourceID)
+    return unsafeBitCast(idRef, to: CFString?.self) as String?
   }
 
   func disable(modes: [InputMode] = []) {

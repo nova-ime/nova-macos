@@ -72,12 +72,16 @@ Nova 换了一种做法：
 
 ## 安装
 
-需要先装好[魔然](https://github.com/rime-moran/rime-moran)方案：Nova 用它的词库 `moran.extended`。用户目录里还要有语法模型 `zh-hans-t-essay-bgw.gram`。这两样本仓库都不包含。
+词库和语法模型来自[万象拼音](https://github.com/amzxyz/rime-wanxiang)（CC-BY-4.0），本仓库不包含。运行 `scripts/wanxiang/setup-wanxiang.sh` 下载并转换：词库是 zrm-fuzhu 版，转成 Nova 的 `音节;辅助码` 编码（`nova_wx`）；语法模型是 `wanxiang-lts-zh-hans.gram`，约 420MB。这个脚本要用到 `gh` 命令行工具。
+
+`nova-schema/nova_lexicon.txt` 是分词词表，由 `scripts/jieba/make-lexicon.py` 从 [jieba](https://github.com/fxsjy/jieba) 的词典（MIT 许可）生成。Nova 用它在解码器给出的长词内部再切分。
 
 ```sh
-scripts/build-nova.sh     # 构建 Release 版，产物在 build-release/
-scripts/install-nova.sh   # 装到 ~/Library/Input Methods，不需要 sudo
+scripts/build-nova.sh     # 构建 Release 版，产物在 build-release/，有 Developer ID 证书时用它签名
+scripts/install-nova.sh   # 装到 /Library/Input Methods，需要 sudo，要在终端里运行
 ```
+
+Nova 要装在 `/Library/Input Methods`。装在 `~/Library/Input Methods` 时，通知中心、锁屏这类系统界面一拿到键盘焦点，就会把输入法换成 ABC，而且不会换回来。
 
 第一次安装时，`~/Library/Rime` 里的方案和词库会复制到 `~/Library/NovaSquirrel`，用户词库不复制，词频从零开始。然后在输入法列表里选"Nova 鼠须管"，按 `F4` 切到 Nova 方案。
 

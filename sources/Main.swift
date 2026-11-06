@@ -15,7 +15,7 @@ struct SquirrelApp {
   } else {
     try! FileManager.default.url(for: .libraryDirectory, in: .userDomainMask, appropriateFor: nil, create: false).appendingPathComponent("NovaSquirrel", isDirectory: true)
   }
-  // 装在 ~/Library/Input Methods，不和官方版抢 /Library/Input Methods/Squirrel.app。
+  // 装在 /Library/Input Methods/NovaSquirrel.app，和官方版的 Squirrel.app 并存。
   static let appDir = Bundle.main.bundleURL
   static let logDir = FileManager.default.temporaryDirectory.appending(component: "rime.nova-squirrel", directoryHint: .isDirectory)
 

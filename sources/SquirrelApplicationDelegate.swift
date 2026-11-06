@@ -7,6 +7,7 @@
 
 import UserNotifications
 import AppKit
+import InputMethodKit
 
 final class SquirrelApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
   static let rimeWikiURL = URL(string: "https://github.com/rime/home/wiki")!
@@ -17,6 +18,9 @@ final class SquirrelApplicationDelegate: NSObject, NSApplicationDelegate, UNUser
   var config: SquirrelConfig?
   var panel: NovaPanel?
   var enableNotifications = false
+  // 用户最后一次自己选的输入法。锁屏期间系统强切 ABC 不算，解锁后靠它切回 Nova。
+  private var lastUserInputSourceID = SquirrelInstaller.currentInputSourceID() ?? ""
+  private var screenLocked = false
   func applicationWillFinishLaunching(_ notification: Notification) {
     panel = NovaPanel()
     addObservers()
@@ -178,6 +182,57 @@ final class SquirrelApplicationDelegate: NSObject, NSApplicationDelegate, UNUser
     let notifCenter = DistributedNotificationCenter.default()
     notifCenter.addObserver(forName: .init("NovaSquirrelReloadNotification"), object: nil, queue: nil, using: rimeNeedsReload)
     notifCenter.addObserver(forName: .init("NovaSquirrelSyncNotification"), object: nil, queue: nil, using: rimeNeedsSync)
+    // 输入法切换通知要立即送达：Nova 是后台程序，默认挂起期间收不到分布式通知。
+    notifCenter.addObserver(self, selector: #selector(inputSourceChanged(_:)),
+                            name: .init(kTISNotifySelectedKeyboardInputSourceChanged as String),
+                            object: nil, suspensionBehavior: .deliverImmediately)
+    notifCenter.addObserver(self, selector: #selector(screenLocked(_:)),
+                            name: .init("com.apple.screenIsLocked"),
+                            object: nil, suspensionBehavior: .deliverImmediately)
+    notifCenter.addObserver(self, selector: #selector(screenUnlocked(_:)),
+                            name: .init("com.apple.screenIsUnlocked"),
+                            object: nil, suspensionBehavior: .deliverImmediately)
+  }
+
+  @objc func inputSourceChanged(_: Notification) {
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      self.finalizeStrandedComposition()
+      // 锁屏界面和密码框会强切 ABC，这种切换不是用户选的，不记。
+      if !self.screenLocked && !IsSecureEventInputEnabled() {
+        self.lastUserInputSourceID = SquirrelInstaller.currentInputSourceID() ?? ""
+      }
+    }
+  }
+
+  @objc func screenLocked(_: Notification) {
+    DispatchQueue.main.async { [weak self] in
+      self?.screenLocked = true
+    }
+  }
+
+  // 锁屏时系统切到 ABC，解锁后不会切回来。锁屏前用的是 Nova、解锁后停在 ABC，就切回 Nova。
+  // 等 1 秒再看：解锁后系统还会再发几次切换通知，等它们过去，期间仍按锁屏处理，不记。
+  @objc func screenUnlocked(_: Notification) {
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+      guard let self else { return }
+      self.screenLocked = false
+      let current = SquirrelInstaller.currentInputSourceID() ?? ""
+      guard current == "com.apple.keylayout.ABC",
+            let mode = SquirrelInstaller.InputMode(rawValue: self.lastUserInputSourceID) else { return }
+      SquirrelInstaller().select(mode: mode)
+    }
+  }
+
+  // macOS 26 起，别的程序用 TISSelectInputSource() 切走输入法时（比如系统按窗口自动切换输入法），
+  // 不会调 deactivateServer：没上屏的内容留在 Rime 里，候选面板也留在屏幕上。
+  // 切换通知还会发，这里补做一次 deactivateServer。从菜单栏手动切换时系统已经调过，这里什么也不做。
+  func finalizeStrandedComposition() {
+    let currentInputSourceID = SquirrelInstaller.currentInputSourceID() ?? ""
+    guard !currentInputSourceID.hasPrefix("im.nova.inputmethod.NovaSquirrel") else { return }
+    if let inputController = panel?.inputController {
+      inputController.deactivateServer(inputController.client())
+    }
   }
 
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
