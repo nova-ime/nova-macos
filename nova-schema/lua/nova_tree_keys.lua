@@ -10,11 +10,14 @@
 -- 选词时只冻结前面的块，所选范围和它后面的部分重新解码，后面的字可以跟新选的字组词
 -- （显 + 时期 → 显示器）；用户选过的块不管在哪都保留。选的词覆盖整个输入时直接上屏。
 -- 空格不管光标在哪都上屏整句；末尾有半个音节时上屏前面的完整部分，见 commit_before_pending。
+-- ; 等于数字 1。有焦点时 [ / ] 伸缩焦点块：[ 让出最后一个音节给右边的块，] 让出第一个音节给左边的块，
+-- 让出的音节和那个相邻块一起单独解码，见 shrink。没有焦点时 [ ] 照常是标点。
 
 local LEFT, RIGHT, SPACE = 0xff51, 0xff53, 0x20
 local HOME, END, BACKSPACE, DELETE = 0xff50, 0xff57, 0xff08, 0xffff
 local PAGE_UP, PAGE_DOWN, COMMA, PERIOD = 0xff55, 0xff56, 0x2c, 0x2e
 local UP, DOWN = 0xff52, 0xff54
+local SEMICOLON, BRACKET_LEFT, BRACKET_RIGHT = 0x3b, 0x5b, 0x5d
 -- Swift 改了 nova_cursor（点击字母或词块）之后发这个键，让树按新光标重画。
 local REFRESH = 0xffd1
 
@@ -27,6 +30,7 @@ local function clear(ctx)
     ctx:set_property("nova_cursor", "")
     ctx:set_property("nova_alt_page", "")
     ctx:set_property("nova_cycle", "")
+    ctx:set_property("nova_redecode", "")
 end
 
 -- 光标位置，以及是否有焦点（nova_cursor 不为空）。
@@ -124,8 +128,9 @@ local function parse_tree(tree)
                         from = tonumber(fields[2]), to = tonumber(fields[3]),
                         text = before_separator(fields[5]), alts = {} }
         for i = 6, #fields do
-            local text, _, to, from = fields[i]:match("^([^\31]*)\31([^\31]*)\31(%d+)\31?(%d*)$")
-            block.alts[#block.alts + 1] = { text = text, to = tonumber(to), from = tonumber(from) }
+            local text, _, to, from, code = fields[i]:match("^([^\31]*)\31([^\31]*)\31(%d+)\31?(%d*)\31?(%l*)")
+            block.alts[#block.alts + 1] = { text = text, to = tonumber(to), from = tonumber(from),
+                                            code = code ~= "" and code or nil }
         end
         blocks[#blocks + 1] = block
         if fields[1]:find("f", 1, true) then focus = #blocks end
@@ -194,6 +199,14 @@ end
 
 local function choose(env, seg, blocks, focus, chosen, alt)
     local ctx = env.engine.context
+    -- 打错键的备选带着改好的编码：换掉这一段输入，整段重新解码。
+    if alt.code then
+        local before, after = ctx.input:sub(1, seg._start), ctx.input:sub(seg._end + 1)
+        clear(ctx)
+        ctx.input = before .. alt.code .. after
+        ctx.caret_pos = #before + #alt.code
+        return
+    end
     local input = ctx.input:sub(seg._start + 1, seg._end)
     -- 单字备选从块中间开始，只换光标处这个字。
     local from = alt.from or chosen.from
@@ -217,15 +230,17 @@ local function choose(env, seg, blocks, focus, chosen, alt)
     ctx:set_property("nova_open_from", from .. ":" .. ctx.input)
     ctx:set_property("nova_alt_page", "")
     ctx:set_property("nova_cycle", "")
+    ctx:set_property("nova_redecode", "")
     ctx:refresh_non_confirmed_composition()
 end
 
 -- Shift+←/→：跳到上一个/下一个词块的开头；往右越过最后一块就回到末尾。
--- Shift+←/→：跳到上一个/下一个词块的末尾。没有焦点时往左到最后一块；最后一块再往右回到没有焦点。
+-- Shift+←/→：跳到上一个/下一个词块的末尾。没有焦点时往左到最后一块、往右到第一块；
+-- 最后一块再往右回到没有焦点，所以一直按 Tab 是循环：第一块 … 最后一块、没有焦点、第一块。
 local function jump_block(ctx, blocks, step)
     local cursor, focused = cursor_of(ctx)
     if not focused then
-        if step < 0 and #blocks > 0 then set_cursor(ctx, blocks[#blocks].to, true) end
+        if #blocks > 0 then set_cursor(ctx, step < 0 and blocks[#blocks].to or blocks[1].to, true) end
     else
         local target
         for i = 1, #blocks do
@@ -294,7 +309,47 @@ local function cycle(env, seg, blocks, focus, step)
     ctx:set_property("nova_pins_end", tostring(#input))
     ctx:set_property("nova_open_from", alt and (low .. ":" .. ctx.input) or "")
     ctx:set_property("nova_cycle", index .. ":" .. signature)
+    ctx:set_property("nova_redecode", "")
     ctx:set_property("nova_alt_page", "")
+    ctx:refresh_non_confirmed_composition()
+end
+
+-- [ / ]：焦点块让出最后一个/第一个音节，留下的字原样固定（和以词定字一样），光标留在这块上，
+-- 可以接着按。让出的音节和右边/左边那块（用户没选过时）一起单独解码，词不越过新边界；
+-- 其他块原样冻结。块只剩一个音节时不动。
+local function shrink(env, seg, blocks, focus, keep_front)
+    local ctx = env.engine.context
+    local input = ctx.input:sub(seg._start + 1, seg._end)
+    local block = blocks[focus]
+    local inside = {}
+    for _, range in ipairs(syllable_ranges(input)) do
+        if range[1] >= block.from and range[2] <= block.to then inside[#inside + 1] = range end
+    end
+    if #inside < 2 then return end
+    local keep_from, keep_to, low, high, neighbor
+    if keep_front then
+        keep_from, keep_to = block.from, inside[#inside - 1][2]
+        neighbor = blocks[focus + 1]
+        low, high = keep_to, (neighbor and not neighbor.chosen) and neighbor.to or block.to
+    else
+        keep_from, keep_to = inside[2][1], block.to
+        neighbor = blocks[focus - 1]
+        low, high = (neighbor and not neighbor.chosen) and neighbor.from or block.from, keep_from
+    end
+    local kept = block_chars(input, block, keep_from, keep_to)
+    if not kept then return end
+    local pins = { pin_line(input, keep_from, keep_to, "h", kept) }
+    for i, other in ipairs(blocks) do
+        if i ~= focus and (other.to <= low or other.from >= high) then
+            pins[#pins + 1] = pin_line(input, other.from, other.to, other.chosen and "h" or "s", other.text)
+        end
+    end
+    ctx:set_property("nova_pins", table.concat(pins))
+    ctx:set_property("nova_pins_end", tostring(#input))
+    ctx:set_property("nova_open_from", math.min(low, keep_from) .. ":" .. ctx.input)
+    ctx:set_property("nova_redecode", low .. ":" .. high .. ":" .. ctx.input)
+    ctx:set_property("nova_cycle", "")
+    set_cursor(ctx, seg._start + keep_to, true)
     ctx:refresh_non_confirmed_composition()
 end
 
@@ -368,9 +423,10 @@ local function func(key, env)
         turn_page(ctx, (code == PAGE_UP or code == COMMA) and -1 or 1)
         return 1
     end
-    local is_digit = code >= 0x31 and code <= 0x39
+    local is_digit = (code >= 0x31 and code <= 0x39) or code == SEMICOLON
     local is_cycle = focused and (code == UP or code == DOWN)
-    if not is_digit and not is_cycle and code ~= LEFT and code ~= RIGHT and code ~= SPACE then return 2 end
+    local is_shrink = focused and (code == BRACKET_LEFT or code == BRACKET_RIGHT)
+    if not is_digit and not is_cycle and not is_shrink and code ~= LEFT and code ~= RIGHT and code ~= SPACE then return 2 end
     local tree = ctx:get_property("nova_tree") or ""
     if tree == "" then return (code == LEFT or code == RIGHT) and 1 or 2 end
     -- 用户翻页或移动高亮后，面板显示的是普通列表，按键归列表。
@@ -379,6 +435,20 @@ local function func(key, env)
     -- 菜单空时过滤器没有运行，属性里还是上一次的树。
     if seg.menu:prepare(1) == 0 then return 2 end
     if code == SPACE then
+        -- 有打错键的原样字母块（标记 t）：第一次空格不上屏，先把多打、漏打的改法也算出来列成备选；
+        -- 再按一次空格原样上屏。
+        local has_typo = false
+        for line in tree:gmatch("[^\n]+") do
+            local flags = line:match("^[^\t]*")
+            local head = flags:match("^[^a]*")
+            if head:find("t", 1, true) then has_typo = true break end
+        end
+        if has_typo and ctx:get_property("nova_fix_full") ~= ctx.input then
+            if focused then set_cursor(ctx, #ctx.input, false) end
+            ctx:set_property("nova_fix_full", ctx.input)
+            ctx:refresh_non_confirmed_composition()
+            return 1
+        end
         -- 空格上屏整句：光标回到末尾，首选本来就覆盖整句。
         if focused then set_cursor(ctx, #ctx.input, false) end
         return commit_before_pending(env, seg) and 1 or 2
@@ -388,8 +458,14 @@ local function func(key, env)
         if focus then cycle(env, seg, blocks, focus, code == DOWN and 1 or -1) end
         return 1
     end
+    if is_shrink then
+        if focus then shrink(env, seg, blocks, focus, code == BRACKET_LEFT) end
+        return 1
+    end
     if is_digit then
-        local chosen, alt = find_choice(blocks, focus, code - 0x30)
+        local chosen, alt = find_choice(blocks, focus, code == SEMICOLON and 1 or code - 0x30)
+        -- ; 没有可选的备选时照常是标点。
+        if not alt and code == SEMICOLON then return 2 end
         -- 没有这个编号时吞掉，否则选中的是面板上看不到的候选。
         if alt then choose(env, seg, blocks, focus, chosen, alt) end
         return 1

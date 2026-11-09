@@ -32,6 +32,72 @@ local function cache_key(env, key)
     return #env.engine.context.input .. ":" .. key
 end
 
+-- 翻译器查一段码的结果，按输入框长度现算 quality。
+--
+-- quality = exp(weight) + initial_quality + quality_len / 输入框长度（script_translator.cc），
+-- quality_len 是这个词按正常拼写匹配的码长（table.cc 的 delta_quality_len，简拼和模糊音少记）。
+-- 只有最后一项随输入框长度变，所以缓存里存去掉它的部分，用的时候按当前长度加回去：
+-- 每打一个音节只需要查新出现的位置，不用把整串重查一遍。
+-- quality_len 不能直接读到：第一次查时先记下 quality，等输入框长度变了再查一次，两次的差解出它。
+-- 所以每段码最多查两次。翻译器给候选的顺序不随长度变（按码长、用户词、词典顺序），照存。
+-- 联想补全（completion）只在码到输入框末尾时出现，字数也和音节数对不上，组句时不要。
+local QUERY_LIMIT = 120  -- 用到的最深处是翻页 PAGE_LIMIT * 3 = 108；150 句实测与 300 输出一致
+local RAW_LIMIT = 4000
+
+-- { {text, end, quality, 序号, nil, 是否联想补全}, ... }，序号从 1 数，整句候选也占一个。
+local function query_all(env, key)
+    local list = {}
+    local seg = Segment(0, #key)
+    seg.tags = Set { "abc" }
+    local translation = env.translator:query(key, seg)
+    if translation then
+        local nxt, this = translation:iter()
+        local seen = 0
+        while seen < QUERY_LIMIT do
+            local cand = nxt(this)
+            if not cand then break end
+            seen = seen + 1
+            if cand.type ~= "sentence" then
+                list[#list + 1] = { cand.text, cand._end, cand.quality, seen, nil, cand.type == "completion" }
+            end
+        end
+    end
+    return list
+end
+
+-- key 的候选：{ list = { {text, end, base, 序号, quality_len}, ... } }，base 去掉了长度项。
+-- 还没解出 quality_len 时，raw.length 是第一次查询时的输入框长度，base 存的是那时的 quality。
+local function raw_words(env, key)
+    local length = #env.engine.context.input
+    local raw = env.raw[key]
+    if raw and (not raw.length or raw.length == length) then return raw end
+    if raw then
+        local now = {}
+        for _, cand in ipairs(query_all(env, key)) do now[cand[1] .. "@" .. cand[2]] = cand[3] end
+        for _, word in ipairs(raw.list) do
+            local quality = now[word[1] .. "@" .. word[2]]
+            local quality_len = word[2]
+            if quality then
+                quality_len = math.floor((quality - word[3]) / (1 / length - 1 / raw.length) + 0.5)
+            end
+            word[3] = word[3] - quality_len / raw.length
+            word[5] = quality_len
+        end
+        raw.length = nil
+        return raw
+    end
+    raw = { list = query_all(env, key), length = length }
+    if env.raw_size >= RAW_LIMIT then env.raw, env.raw_size = {}, 0 end
+    env.raw[key] = raw
+    env.raw_size = env.raw_size + 1
+    return raw
+end
+
+-- 当前输入框长度下的 quality。
+local function quality_now(raw, word, length)
+    return raw.length and word[3] or word[3] + word[5] / length
+end
+
 -- 从 tokens[first] 开始的所有词，返回 { [音节数] = { {text, score}, ... } }。
 -- 缓存按输入串共用，所以这里不能存绝对位置。
 local function words_from(env, tokens, first)
@@ -41,33 +107,27 @@ local function words_from(env, tokens, first)
     local cached = env.cache[slot]
     if cached then return cached end
 
-    local ends, by_end, offset = {}, {}, 0
+    local ends, offset = {}, 0
     for i = first, last do
         offset = offset + #tokens[i]
         ends[offset] = i - first + 1
     end
-    local seg = Segment(0, #key)
-    seg.tags = Set { "abc" }
-    local translation = env.translator:query(key, seg)
-    if translation then
-        local nxt, this = translation:iter()
-        local seen = 0
-        while seen < 300 do
-            local cand = nxt(this)
-            if not cand then break end
-            seen = seen + 1
-            local length = ends[cand._end]
-            if length and cand.type ~= "sentence" and cand.quality > 0 then
-                local list = by_end[length]
-                if not list then
-                    list = {}
-                    by_end[length] = list
-                end
-                if #list < WORDS_PER_SPAN then
-                    list[#list + 1] = { cand.text, math.log(cand.quality) }
-                end
-            end
+    local length = #env.engine.context.input
+    local by_end = {}
+    local raw = raw_words(env, key)
+    -- 保持翻译器给的顺序：它不是严格按 quality 排的（用户词优先、同权重按词典顺序），
+    -- 重排会换掉前 WORDS_PER_SPAN 个里的词。
+    for _, word in ipairs(raw.list) do
+        local count = ends[word[2]]
+        if count and not word[6] then
+            local quality = quality_now(raw, word, length)
+            local out = by_end[count]
+            if not out then out = {}; by_end[count] = out end
+            if quality > 0 and #out < WORDS_PER_SPAN then out[#out + 1] = { word[1], math.log(quality) } end
         end
+    end
+    for count, out in pairs(by_end) do
+        if #out == 0 then by_end[count] = nil end
     end
     if env.cache_size >= CACHE_LIMIT then
         env.cache, env.cache_size, env.weights, env.decoded = {}, 0, {}, {}
@@ -77,21 +137,21 @@ local function words_from(env, tokens, first)
     return by_end
 end
 
-local function best_paths(extensions)
+local function best_paths(extensions, beam)
     table.sort(extensions, function(a, b) return a[2] > b[2] end)
     local seen, result = {}, {}
     for _, path in ipairs(extensions) do
         if not seen[path[1]] then
             seen[path[1]] = true
             result[#result + 1] = path
-            if #result >= BEAM then break end
+            if #result >= (beam or BEAM) then break end
         end
     end
     return result
 end
 
 -- prefix 不为空时只留和它一致的路径：开头这几个字固定，词可以从它们跨到后面（显 + 示器）。
-local function sentences(env, tokens, prefix)
+local function sentences(env, tokens, prefix, beam)
     local n = #tokens
     local pending = {}
     for i = 1, n do pending[i] = {} end
@@ -112,7 +172,7 @@ local function sentences(env, tokens, prefix)
             end
         end
         if #pending[first] > 0 then
-            paths[first] = best_paths(pending[first])
+            paths[first] = best_paths(pending[first], beam)
         end
     end
     return paths[n] or {}
@@ -218,20 +278,16 @@ local function span_weights(env, key, want)
     local cached = env.weights[slot]
     if cached then return cached end
     local top, count, lowest = {}, 0, math.huge
-    local seg = Segment(0, #key)
-    seg.tags = Set { "abc" }
-    local translation = env.translator:query(key, seg)
-    if translation then
-        local nxt, this = translation:iter()
-        for _ = 1, 100 do
-            local cand = nxt(this)
-            if not cand then break end
-            if cand._end == #key and cand.type ~= "sentence" and utf8.len(cand.text) == want then
-                lowest = math.min(lowest, cand.quality)
-                if count < WORDS_PER_SPAN then
-                    top[cand.text] = cand.quality
-                    count = count + 1
-                end
+    local length = #env.engine.context.input
+    local raw = raw_words(env, key)
+    for _, word in ipairs(raw.list) do
+        if word[4] > 100 then break end
+        if word[2] == #key and utf8.len(word[1]) == want then
+            local quality = quality_now(raw, word, length)
+            lowest = math.min(lowest, quality)
+            if count < WORDS_PER_SPAN then
+                top[word[1]] = quality
+                count = count + 1
             end
         end
     end
@@ -421,7 +477,9 @@ local function split_by_decoder(env, tokens, first, last, text, spans, blocks)
     end
 end
 
-local function build_blocks(env, tokens, pins, default_text, spans)
+-- redecode 是伸缩块时让出音节的那一段（音节下标 { first, last }）：不取首选里的字，单独解码，
+-- 这样词不会越过用户定的边界。
+local function build_blocks(env, tokens, pins, default_text, spans, redecode)
     local blocks, n, i = {}, #tokens, 1
     local has_pin = next(pins) ~= nil
     local before -- 紧挨在前面的固定段
@@ -437,7 +495,9 @@ local function build_blocks(env, tokens, pins, default_text, spans)
             -- 才单独解码这一段。首选和前面的固定段对不上时（用户改了那里的字），
             -- 带着固定段一起解码，后面的字才能跟它组词。
             local text, from_default
-            if default_text and not (before and char_sub(default_text, before.first, i - 1) ~= before.text) then
+            if redecode and i <= redecode.last and stop >= redecode.first then
+                text = decode(env, tokens, i, stop)
+            elseif default_text and not (before and char_sub(default_text, before.first, i - 1) ~= before.text) then
                 text = char_sub(default_text, i, stop)
                 from_default = true
             elseif before then
@@ -506,18 +566,9 @@ end
 -- key 这段编码下长度为 want 的词，按翻译器的顺序，最多 limit 个。翻页时用，比 words_from 深。
 local function span_words(env, key, want, limit)
     local words = {}
-    local seg = Segment(0, #key)
-    seg.tags = Set { "abc" }
-    local translation = env.translator:query(key, seg)
-    if translation then
-        local nxt, this = translation:iter()
-        for _ = 1, limit * 3 do
-            local cand = nxt(this)
-            if not cand or #words >= limit then break end
-            if cand._end == #key and cand.type ~= "sentence" and utf8.len(cand.text) == want then
-                words[#words + 1] = cand.text
-            end
-        end
+    for _, word in ipairs(raw_words(env, key).list) do
+        if word[4] > limit * 3 or #words >= limit then break end
+        if word[2] == #key and utf8.len(word[1]) == want then words[#words + 1] = word[1] end
     end
     return words
 end
@@ -609,12 +660,31 @@ local function measure_block(env, block, tokens)
             if text ~= block.text and (share_of(weights, text) or 0) > block.share then block.corrected = true; break end
         end
     end
-    block.disagree = not block.pinned and window_disagreements(env, block, tokens) or 0
-    block.uncertain = not block.corrected and block.disagree >= UNCERTAIN_WINDOWS
+    -- nova_lm 插件开着时由它按 GPT-2 标橙，这里的窗口解码（每块好几次整段查询）就省掉。
+    block.disagree = not block.pinned and not env.lm_orange and window_disagreements(env, block, tokens) or 0
+    block.uncertain = not block.corrected and not block.aux_words and block.disagree >= UNCERTAIN_WINDOWS
 end
 
 -- 编号不够时，让最不确定的块先拿到，每块要么全有要么没有：橙的先，窗口不一致多的先，然后是紫的。
 local function pick_overview(env, blocks, tokens, offsets)
+    -- 辅助码筛完还剩几个字的块：编号全给它，按词库顺序列出，别的块这时不给备选。
+    local labels = 0
+    for _, block in ipairs(blocks) do
+        if block.aux_words then
+            local last = block.last
+            local weights = span_weights(env, block.key, last - block.first + 1)
+            local alts = {}
+            for _, text in ipairs(block.aux_words) do
+                if labels + #alts >= MAX_LABELS then break end
+                if text ~= block.text then
+                    alts[#alts + 1] = { text = text, to = offsets[last] + #tokens[last], share = share_of(weights, text) }
+                end
+            end
+            if #alts > 0 then block.overview = alts end
+            labels = labels + #alts
+        end
+    end
+    if labels > 0 then return end
     local uncertain = {}
     for _, block in ipairs(blocks) do
         if block.uncertain or block.corrected then
@@ -626,7 +696,6 @@ local function pick_overview(env, blocks, tokens, offsets)
         if a.disagree ~= b.disagree then return a.disagree > b.disagree end
         return (a.share or 100) < (b.share or 100)
     end)
-    local labels = 0
     for _, block in ipairs(uncertain) do
         local alts = alternatives(env, tokens, offsets, block)
         for i = #alts, OVERVIEW_ALTS + 1, -1 do alts[i] = nil end
@@ -667,6 +736,7 @@ local function serialize(env, blocks, tokens, offsets, focus, ages, cursor_sylla
         local flags = block.pinned and "1" or "0"
         if i == focus then flags = flags .. "f" end
         if block.corrected then flags = flags .. "c" end
+        if block.aux_words then flags = flags .. "x" end
         if block.overview then flags = flags .. "o" end
         if block.uncertain then flags = flags .. "u" end
         local from, to = offsets[block.first], offsets[block.last] + #tokens[block.last]
@@ -782,11 +852,29 @@ end
 
 -- 打大写辅助码就是选字，和数字键选词一样：辅助码所在的整个词当场固定成用户选的（货号 + K）。
 -- 之后补打或删掉辅助码，键对不上，这个选择作废，按新的辅助码重新筛选后再固定。
-local function choose_by_aux(context, blocks, tokens, offsets)
+-- 筛完还剩不止一个词时（ui + A 有十、事、史、师……）先不固定，把它们列成备选（x 标记），
+-- 用户按数字键选，或者再补一个辅助码筛到只剩一个。
+local function choose_by_aux(env, blocks, tokens, offsets)
+    local context = env.engine.context
     local chosen, starts = {}, {}
     for _, block in ipairs(blocks) do
         local key = table.concat(tokens, "", block.first, block.last)
-        if not block.pinned and key:find("%u") then
+        local words = not block.pinned and key:find("%u") and span_words(env, key, block.last - block.first + 1, MAX_LABELS + 1)
+        -- 扩展区的生僻字（hk + N 除了好还有 𡚽、㚪）不算，不然几乎每个辅助码都要再选一次。
+        if words then
+            local common = {}
+            for _, text in ipairs(words) do
+                local basic = true
+                for _, code in utf8.codes(text) do
+                    if code < 0x4E00 or code > 0x9FFF then basic = false; break end
+                end
+                if basic then common[#common + 1] = text end
+            end
+            words = common
+        end
+        if words and #words > 1 then
+            block.aux_words = words
+        elseif words then
             block.pinned = true
             local from = offsets[block.first]
             starts[tostring(from)] = true
@@ -816,7 +904,17 @@ local function build_tree(env, tokens, seg, cand, stop)
     local pins = parse_pins(env, tokens, offsets, context.input:sub(seg._start + 1, seg._end), frozen)
     local default_text = utf8.len(cand.text) == #tokens and cand.text or nil
     local spans = default_text and decoder_spans(cand, tokens)
-    local blocks = build_blocks(env, tokens, pins, default_text, spans)
+    -- nova_redecode：`起:止:输入`，nova_tree_keys 伸缩块时写，输入变了就失效。
+    local redecode
+    local rfrom, rto, rinput = (context:get_property("nova_redecode") or ""):match("^(%d+):(%d+):(.*)$")
+    if rinput == context.input then
+        for i = 1, #tokens do
+            if offsets[i] == tonumber(rfrom) then redecode = { first = i } end
+            if redecode and offsets[i] + #tokens[i] == tonumber(rto) then redecode.last = i break end
+        end
+        if redecode and not redecode.last then redecode = nil end
+    end
+    local blocks = build_blocks(env, tokens, pins, default_text, spans, redecode)
     if not blocks then return nil end
     -- 树原样保留时（输入没变、只多了半个音节）分组也不变。
     if not same_input and stop == seg._end then
@@ -826,7 +924,7 @@ local function build_tree(env, tokens, seg, cand, stop)
         end
         context:set_property("nova_tree_groups", table.concat(groups, "\n"))
     end
-    choose_by_aux(context, blocks, tokens, offsets)
+    choose_by_aux(env, blocks, tokens, offsets)
     local focus, cursor_syllable = focused_index(env, blocks, offsets, tokens, seg)
     -- 没打完的字母不算，只在多了完整音节时加一。
     local grew = not same_input and stop == seg._end
@@ -838,18 +936,200 @@ local function build_tree(env, tokens, seg, cand, stop)
     return tree, replacement
 end
 
+-- 打错键 ------------------------------------------------------------------
+-- 编码里出现不成立的音节时（librime 的首选只覆盖到这里），前面照常出树，
+-- 从这里到末尾是一块原样的字母（标记 t，标橙）。它的备选是改一个键之后编码成立的写法：
+-- 相邻键、两键颠倒、多打一个键、漏打一个键。备选带着改好的编码，选中就换掉输入。
+-- 只在编码不成立时才算，打对的编码不受影响。
+local FIX_WINDOW = 6     -- 往卡住的地方前面看几个音节（漏键、多键时打错的键在卡住处之前）
+local FIX_RIGHT = 8      -- 打分时卡住处之后带几个字母
+local FIX_ALTS = 3
+local FIX_LM_ALTS = 200  -- 交给 GPT-2 重排的写法数
+local FIX_COST = { n = 1.0, s = 1.0, d = 2.5, i = 2.5 }  -- 相邻键、颠倒、多打、漏打的罚分
+local FIX_BUDGET = 0.03  -- 秒，打字时的上限，超时就用已经算出的
+local KEY_ROWS = { "qwertyuiop", "asdfghjkl;", "zxcvbnm,./" }
+
+local NEIGHBOURS = {}
+for r, row in ipairs(KEY_ROWS) do
+    for i = 1, #row do
+        local c = row:sub(i, i)
+        if c:match("%a") then
+            local list = {}
+            for _, d in ipairs({ { 0, -1 }, { 0, 1 }, { -1, 0 }, { -1, 1 }, { 1, -1 }, { 1, 0 } }) do
+                local other = KEY_ROWS[r + d[1]]
+                local n = other and other:sub(i + d[2], i + d[2]) or ""
+                if n:match("^%a$") then list[#list + 1] = n end
+            end
+            NEIGHBOURS[c] = list
+        end
+    end
+end
+
+-- 两个字母是不是一个音节：翻译器能给出正好两个字母长的字。
+local function valid_pair(env, pair)
+    local v = env.valid[pair]
+    if v == nil then
+        v = false
+        for _, word in ipairs(raw_words(env, pair).list) do
+            if word[2] == 2 then v = true break end
+        end
+        env.valid[pair] = v
+    end
+    return v
+end
+
+local function all_valid(env, code)
+    if #code % 2 == 1 then return false end
+    for i = 1, #code, 2 do
+        if not valid_pair(env, code:sub(i, i + 1)) then return false end
+    end
+    return true
+end
+
+-- 改一个键的所有写法：{ 编码, 种类, 改动位置 }，位置从 0 数。
+local function fix_variants(env, code, broken, full)
+    local seen, out = { [code] = true }, {}
+    local function add(v, kind, at)
+        if not seen[v] then
+            seen[v] = true
+            if all_valid(env, v) then out[#out + 1] = { v, kind, at } end
+        end
+    end
+    local lo = math.max(0, broken - 2 * FIX_WINDOW)
+    for p = lo, math.min(#code - 1, broken + 1) do
+        local c = code:sub(p + 1, p + 1)
+        local before, after = code:sub(1, p), code:sub(p + 2)
+        if p + 1 < #code then add(before .. code:sub(p + 2, p + 2) .. c .. code:sub(p + 3), "s", p) end
+        for _, n in ipairs(NEIGHBOURS[c] or {}) do add(before .. n .. after, "n", p) end
+        if full then
+            add(before .. after, "d", p)
+            for b = 97, 122 do add(before .. string.char(b) .. c .. after, "i", p) end
+        end
+    end
+    if full and broken >= #code - 2 then
+        for b = 97, 122 do add(code .. string.char(b), "i", #code) end
+    end
+    return out, lo
+end
+
+local function best_score(env, tokens, beam)
+    local paths = sentences(env, tokens, nil, beam)
+    return paths[1] and paths[1][2], paths[1] and paths[1][1]
+end
+
+-- librime 给这串编码解出的整句（带语法模型，比这里的 sentences 准）。解不出整句时返回 nil。
+local function librime_sentence(env, key)
+    local seg = Segment(0, #key)
+    seg.tags = Set { "abc" }
+    local translation = env.translator:query(key, seg)
+    if not translation then return nil end
+    local nxt, this = translation:iter()
+    local cand = nxt(this)
+    if cand and cand._end == #key then return cand.text end
+end
+
+-- 返回排好的备选：{ code = 改好的整段编码, text = 改动处附近解出的字 }。
+-- full：也试多打、漏打。这两种每次有近百种写法，每种都要查翻译器，只在用户按空格要求时算。
+local function typo_fixes(env, code, broken, full)
+    local started = os.clock()
+    local variants, lo = fix_variants(env, code, broken, full)
+    -- 先算卡住的音节和它附近的音节，便宜的改法在前。打字时有时间上限，排在后面的可能算不到。
+    local home = math.floor(broken / 2)
+    table.sort(variants, function(a, b)
+        local da, db = math.abs(home - math.floor(a[3] / 2)), math.abs(home - math.floor(b[3] / 2))
+        if da ~= db then return da < db end
+        if FIX_COST[a[2]] ~= FIX_COST[b[2]] then return FIX_COST[a[2]] < FIX_COST[b[2]] end
+        return a[1] < b[1]
+    end)
+    local function window_of(v)
+        local width = math.min(#v[1] - lo, broken - lo + FIX_RIGHT)
+        width = width - width % 2
+        return syllables(v[1]:sub(lo + 1, lo + width))
+    end
+    -- 前 lo 个字母所有写法都一样，解一次，接在每种写法的窗口前面交给 GPT-2。
+    local head = ""
+    if lo > 0 then head = librime_sentence(env, code:sub(1, lo)) or "" end
+    local scored = {}
+    for _, v in ipairs(variants) do
+        if not full and os.clock() - started > FIX_BUDGET then break end
+        -- 只解卡住处附近一段。
+        local window = window_of(v)
+        -- 插件开着时只要字（GPT-2 打分），不算词库分数。
+        local score, text = 0, nil
+        if window and #window > 0 then
+            if env.lm_orange then text = librime_sentence(env, table.concat(window))
+            else score, text = best_score(env, window) end
+        end
+        if score and text and utf8.len(text) == #window then
+            -- 从改动处前一个音节开始显示，看得出换掉了什么。
+            local first = math.max(1, math.floor(v[3] / 2) - lo / 2)
+            local last = math.min(#window, first + 4)
+            local shown = text:sub(utf8.offset(text, first), (utf8.offset(text, last + 1) or #text + 1) - 1)
+            scored[#scored + 1] = { code = v[1], kind = v[2], at = v[3], score = score - FIX_COST[v[2]], tokens = #window,
+                                    text = shown, sentence = head .. text, order = #scored + 1 }
+        end
+    end
+    -- 插件开着时按上面的顺序给 GPT-2 最多 FIX_LM_ALTS 种（词库分数几乎只看切出几个词，区分不了），
+    -- 由它重排后留 FIX_ALTS 个；没开时按词库分数取前 FIX_ALTS 个。
+    if not env.lm_orange then table.sort(scored, function(a, b) return a.score > b.score end) end
+    local fixes = {}
+    for i = 1, math.min(env.lm_orange and FIX_LM_ALTS or FIX_ALTS, #scored) do
+        local s = scored[i]
+        fixes[#fixes + 1] = { code = s.code, text = s.text, kind = s.kind, sentence = s.sentence }
+    end
+    local dump = os.getenv("NOVA_FIX_DUMP")
+    if dump then
+        local f = io.open(dump, "a")
+        if f then
+            for rank, s in ipairs(scored) do
+                f:write(table.concat({ code, s.code, s.kind, s.at, string.format("%.3f", s.score), s.tokens, rank }, "\t"), "\n")
+            end
+            f:write(table.concat({ code, "#time", string.format("%.1f", 1000 * (os.clock() - started)), #variants, full and "full" or "quick" }, "\t"), "\n")
+            f:close()
+        end
+    end
+    return fixes
+end
+
+-- 原样字母这一块。有备选时只有它带数字键：用户这会儿要改的是这里。
+local function tail_line(env, code, broken, fixes)
+    local flags = "0t" .. (#fixes > 0 and "o" or "") .. "ua0"
+    local fields = { flags, tostring(broken), tostring(#code), code:sub(broken + 1), field(code:sub(broken + 1), nil) }
+    for _, fix in ipairs(fixes) do
+        fields[#fields + 1] = env.lm_orange and field(fix.text, nil, #code, broken, fix.code, fix.kind, fix.sentence)
+                              or field(fix.text, nil, #code, broken, fix.code)
+    end
+    return table.concat(fields, "\t")
+end
+
+local function without_overview(tree)
+    local lines = {}
+    for line in tree:gmatch("[^\n]+") do
+        local fields = {}
+        for value in line:gmatch("[^\t]+") do fields[#fields + 1] = value end
+        local head, tail = fields[1]:match("^([^a]*)(.*)$")
+        fields[1] = head:gsub("o", "") .. tail
+        lines[#lines + 1] = table.concat(fields, "\t", 1, math.min(#fields, 5))
+    end
+    return table.concat(lines, "\n")
+end
+
 local function init(env)
     load_lexicon()
+    env.valid, env.fixes = {}, {}
     env.translator = Component.Translator(env.engine, "", "script_translator@translator")
     env.cache, env.cache_size, env.weights, env.decoded = {}, 0, {}, {}
+    env.raw, env.raw_size = {}, 0
     -- contextual_suggestions 打开时，翻译器按上一次上屏的文字调整分数（poet.h 的 ContextualWeighted），
     -- 上屏后缓存里的分数就过期了，清掉。
     env.commit = env.engine.context.commit_notifier:connect(function()
         env.cache, env.cache_size, env.weights, env.decoded = {}, 0, {}, {}
+        env.raw, env.raw_size = {}, 0
     end)
     env.word_penalty = env.engine.schema.config:get_double("nova_sentences/word_penalty") or 0.0
     env.tree_enabled = env.engine.schema.config:get_bool("nova_tree/enabled") or false
     env.tree_debug = env.engine.schema.config:get_bool("nova_tree/debug") or false
+    env.lm_orange = env.engine.schema.config:get_bool("nova_lm/enabled") or false
 end
 
 local function func(input, env)
@@ -865,6 +1145,23 @@ local function func(input, env)
         local shown = cand
         if first and env.tree_enabled then
             local tree = ""
+            -- 首选停在一个不成立的音节前：后面全部当原样字母，前面照常出树。
+            local typo
+            if tokens and #tokens >= 1 and cand._end < stop then
+                local code = context.input:sub(seg._start + 1, seg._end)
+                local at = cand._end - seg._start
+                local offsets = token_offsets(tokens)
+                for i = 1, #tokens do
+                    if offsets[i] == at then
+                        if not valid_pair(env, tokens[i]:sub(1, 2)) then
+                            typo = { code = code, broken = at }
+                            tokens = { table.unpack(tokens, 1, i - 1) }
+                            stop = cand._end
+                        end
+                        break
+                    end
+                end
+            end
             if tokens and #tokens >= 1 then
                 -- 树出错时退回普通列表，不能让候选消失。
                 local ok, result, replacement = pcall(build_tree, env, tokens, seg, cand, stop)
@@ -877,9 +1174,25 @@ local function func(input, env)
                 end
             end
             -- 只打了一个字母：还没有词块，面板不显示，输入框里也只留这个字母。
-            if tokens and #tokens == 0 then
+            if tokens and #tokens == 0 and not typo then
                 tree = "\n"
                 shown = Candidate("raw", seg._start, seg._end, pending, "")
+            end
+            if typo and not typo.code:find("%u") then
+                local full = context:get_property("nova_fix_full") == context.input
+                local key = (full and "F" or "Q") .. typo.code
+                local ok, fixes = true, env.fixes[key]
+                if not fixes then
+                    ok, fixes = pcall(typo_fixes, env, typo.code, typo.broken, full)
+                    if ok then env.fixes = { [key] = fixes } end
+                end
+                if not ok then
+                    log.error("nova_sentences: " .. tostring(fixes))
+                    fixes = {}
+                end
+                if #fixes > 0 and tree ~= "" and tree ~= "\n" then tree = without_overview(tree) end
+                local line = tail_line(env, typo.code, typo.broken, fixes)
+                tree = (tree == "" or tree == "\n") and line or tree .. "\n" .. line
             end
             context:set_property("nova_tree", tree)
             context:set_property("nova_tree_input", context.input)
