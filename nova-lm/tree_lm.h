@@ -1,0 +1,277 @@
+// GPT-2 (GGUF, arch gpt2) prefix-tree scorer on ggml's CPU backend.
+//
+// Every tree node is one token with one KV cell; a node attends to its ancestor chain only, so
+// candidates that share a prefix share its computation. flush() runs, in one batch, only the nodes
+// added since the last flush. Scores come from the parent's final hidden state:
+// log p(tok | ancestors) = wte[tok] . h(parent) - lse(parent).
+#pragma once
+
+#include <cstdlib>
+#include <Accelerate/Accelerate.h>
+#include <ggml-alloc.h>
+#include <ggml-backend.h>
+#include <ggml.h>
+#include <gguf.h>
+
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
+namespace nova_lm {
+
+class TreeLM {
+ public:
+  ~TreeLM() {
+    if (galloc_) ggml_gallocr_free(galloc_);
+    for (auto *b : {kbuf_, wbuf_, rbuf_})
+      if (b) ggml_backend_buffer_free(b);
+    for (auto *c : {kctx_, wctx_, rctx_})
+      if (c) ggml_free(c);
+    if (be_) ggml_backend_free(be_);
+  }
+
+  // cap = number of KV cells (tree nodes, context included) kept at once.
+  // backend_dir: where the ggml CPU backend libraries are (libggml-cpu-*.so); empty means
+  // ggml's built-in search path.
+  bool load(const std::string &path, int threads, int cap, const std::string &backend_dir = "") {
+    // The CPU backend runs on libomp, whose workers busy-wait 200 ms after each parallel region by default.
+    // In an input method that burns several cores after every key. 0 is slower (a graph wakes
+    // the workers many times); 5 ms keeps them warm within one key: 400 typed sentences give
+    // p50/p99 3.5/7.2 ms against 4.2/10.0 at 200 and 8.0/12.3 at 0. Read when libomp starts;
+    // a setting already in the environment wins.
+    setenv("KMP_BLOCKTIME", "5", 0);
+    if (!backend_dir.empty()) ggml_backend_load_all_from_path(backend_dir.c_str());
+    if (!ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) ggml_backend_load_all();
+    be_ = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (!be_) return false;
+    auto set_threads = (ggml_backend_set_n_threads_t)ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(be_)), "ggml_backend_set_n_threads");
+    if (set_threads) set_threads(be_, threads);
+    // Matmul weights go to the CPU "repack" buffer (interleaved Q8_0 for the i8mm GEMM kernels),
+    // everything else (embeddings for get_rows, norms, biases) to the plain buffer.
+    ggml_backend_buffer_type_t repack = nullptr;
+    ggml_backend_dev_t dev = ggml_backend_get_device(be_);
+    auto reg = ggml_backend_dev_backend_reg(dev);
+    if (auto fx = (ggml_backend_dev_get_extra_bufts_t)ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_dev_get_extra_bufts"))
+      for (auto *b = fx(dev); b && *b; b++)
+        if (strstr(ggml_backend_buft_name(*b), "REPACK")) repack = *b;
+
+    ggml_context *meta = nullptr;
+    gguf_init_params gp{true, &meta};
+    gguf_context *g = gguf_init_from_file(path.c_str(), gp);
+    if (!g) return false;
+    auto u32 = [&](const char *k) {
+      int64_t id = gguf_find_key(g, k);
+      return id < 0 ? 0 : (int)gguf_get_val_u32(g, id);
+    };
+    L_ = u32("gpt2.block_count");
+    D_ = u32("gpt2.embedding_length");
+    NH_ = u32("gpt2.attention.head_count");
+    int64_t tk = gguf_find_key(g, "tokenizer.ggml.tokens");
+    if (!L_ || !D_ || !NH_ || tk < 0) { gguf_free(g); ggml_free(meta); return false; }
+    for (size_t i = 0, n = gguf_get_arr_n(g, tk); i < n; i++) tokens_.push_back(gguf_get_arr_str(g, tk, i));
+
+    int64_t nt = gguf_get_n_tensors(g);
+    ggml_init_params ip{ggml_tensor_overhead() * (nt + 1), nullptr, true};
+    wctx_ = ggml_init(ip);
+    rctx_ = ggml_init(ip);
+    auto is_mm = [](const char *n) {
+      for (const char *s : {"attn_qkv.weight", "attn_output.weight", "ffn_up.weight", "ffn_down.weight"})
+        if (strstr(n, s)) return true;
+      return false;
+    };
+    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> dst(nt);  // (main, tied output copy)
+    bool has_out = false;
+    for (int64_t i = 0; i < nt; i++) {
+      const char *n = gguf_get_tensor_name(g, i);
+      ggml_tensor *src = ggml_get_tensor(meta, n);
+      ggml_tensor *t = ggml_dup_tensor(repack && is_mm(n) && ggml_is_quantized(src->type) ? rctx_ : wctx_, src);
+      ggml_set_name(t, n);
+      dst[i].first = t;
+      has_out |= !strcmp(n, "output.weight");
+    }
+    for (int64_t i = 0; i < nt && !has_out; i++)
+      if (!strcmp(gguf_get_tensor_name(g, i), "token_embd.weight")) {  // tied output head
+        dst[i].second = ggml_dup_tensor(repack && ggml_is_quantized(dst[i].first->type) ? rctx_ : wctx_, dst[i].first);
+        ggml_set_name(dst[i].second, "output.weight");
+      }
+    wbuf_ = ggml_backend_alloc_ctx_tensors(wctx_, be_);
+    if (repack) rbuf_ = ggml_backend_alloc_ctx_tensors_from_buft(rctx_, repack);
+    FILE *f = fopen(path.c_str(), "rb");
+    bool ok = f != nullptr;
+    std::vector<char> tmp;
+    for (int64_t i = 0; ok && i < nt; i++) {
+      tmp.resize(ggml_nbytes(dst[i].first));
+      fseek(f, (long)(gguf_get_data_offset(g) + gguf_get_tensor_offset(g, i)), SEEK_SET);
+      ok = fread(tmp.data(), 1, tmp.size(), f) == tmp.size();
+      if (!ok) break;
+      ggml_backend_tensor_set(dst[i].first, tmp.data(), 0, tmp.size());
+      if (dst[i].second) ggml_backend_tensor_set(dst[i].second, tmp.data(), 0, tmp.size());
+    }
+    if (f) fclose(f);
+    gguf_free(g);
+    ggml_free(meta);
+    if (!ok) return false;
+    wte_ = W("token_embd.weight");
+    wpe_ = W("position_embd.weight");
+    out_ = W("output.weight");
+    if (!wte_ || !wpe_ || !out_) return false;
+    V_ = (int)wte_->ne[1];
+    npos_ = (int)wpe_->ne[1];
+
+    cap_ = cap;
+    ggml_init_params kp{ggml_tensor_overhead() * (2 * L_ + 1), nullptr, true};
+    kctx_ = ggml_init(kp);
+    for (int l = 0; l < L_; l++) {
+      kc_.push_back(ggml_new_tensor_2d(kctx_, GGML_TYPE_F16, D_, cap_));  // [D, cell]
+      vc_.push_back(ggml_new_tensor_2d(kctx_, GGML_TYPE_F16, D_, cap_));
+    }
+    kbuf_ = ggml_backend_alloc_ctx_tensors(kctx_, be_);
+    galloc_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be_));
+    meta_.resize(ggml_tensor_overhead() * 4096 + ggml_graph_overhead_custom(4096, false));
+    row_.resize(D_);
+    ebuf_.resize(V_);
+    return true;
+  }
+
+  const std::vector<std::string> &tokens() const { return tokens_; }
+  int size() const { return (int)nodes_.size(); }
+  int capacity() const { return cap_; }
+  int pos(int node) const { return nodes_[node].pos; }
+  int max_pos() const { return npos_; }
+
+  // Drop every node from `keep` on (their KV cells are reused).
+  void truncate(int keep) {
+    nodes_.resize(keep);
+    if (done_ > keep) done_ = keep;
+  }
+
+  // parent < 0 starts a root. Returns the node id, or -1 when the tree is full.
+  int add(int parent, int tok) {
+    if ((int)nodes_.size() >= cap_) return -1;
+    int pos = parent < 0 ? 0 : nodes_[parent].pos + 1;
+    if (pos >= npos_) return -1;
+    nodes_.push_back({parent, pos, tok, 0.f, {}});
+    return (int)nodes_.size() - 1;
+  }
+
+  // log p(tok | node and its ancestors). The node must be flushed.
+  float logp(int node, int tok) {
+    const Node &p = nodes_[node];
+    const char *src = (const char *)wte_->data + (size_t)tok * wte_->nb[1];
+    if (wte_->type == GGML_TYPE_F32) memcpy(row_.data(), src, D_ * sizeof(float));
+    else ggml_get_type_traits(wte_->type)->to_float(src, row_.data(), D_);
+    float s;
+    vDSP_dotpr(row_.data(), 1, p.h.data(), 1, &s, D_);
+    return s - p.lse;
+  }
+
+  bool flushed(int node) const { return node < done_; }
+
+  // Run all nodes added since the last flush.
+  void flush() {
+    int c0 = done_, n = (int)nodes_.size() - c0, nkv = (int)nodes_.size();
+    if (n <= 0) return;
+    ggml_init_params cp{meta_.size(), meta_.data(), true};
+    ggml_context *ctx = ggml_init(cp);
+    ggml_cgraph *gf = ggml_new_graph_custom(ctx, 4096, false);
+    ggml_tensor *tok = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n), *pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n);
+    ggml_tensor *mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, nkv, n);
+    ggml_set_input(tok);
+    ggml_set_input(pos);
+    ggml_set_input(mask);
+    const int hd = D_ / NH_;
+    ggml_tensor *x = ggml_add(ctx, ggml_get_rows(ctx, wte_, tok), ggml_get_rows(ctx, wpe_, pos));
+    char nm[64];
+    auto Wl = [&](const char *fmt, int l) { snprintf(nm, sizeof nm, fmt, l); return W(nm); };
+    for (int l = 0; l < L_; l++) {
+      ggml_tensor *h = ggml_norm(ctx, x, 1e-5f);
+      h = ggml_add(ctx, ggml_mul(ctx, h, Wl("blk.%d.attn_norm.weight", l)), Wl("blk.%d.attn_norm.bias", l));
+      ggml_tensor *qkv = ggml_add(ctx, ggml_mul_mat(ctx, Wl("blk.%d.attn_qkv.weight", l), h), Wl("blk.%d.attn_qkv.bias", l));
+      ggml_tensor *k = ggml_view_2d(ctx, qkv, D_, n, qkv->nb[1], D_ * sizeof(float));
+      ggml_tensor *v = ggml_view_2d(ctx, qkv, D_, n, qkv->nb[1], 2 * D_ * sizeof(float));
+      ggml_build_forward_expand(gf, ggml_cpy(ctx, k, ggml_view_2d(ctx, kc_[l], D_, n, kc_[l]->nb[1], c0 * kc_[l]->nb[1])));
+      ggml_build_forward_expand(gf, ggml_cpy(ctx, v, ggml_view_2d(ctx, vc_[l], D_, n, vc_[l]->nb[1], c0 * vc_[l]->nb[1])));
+      ggml_tensor *q = ggml_permute(ctx, ggml_view_3d(ctx, qkv, hd, NH_, n, hd * sizeof(float), qkv->nb[1], 0), 0, 2, 1, 3);
+      ggml_tensor *K = ggml_view_3d(ctx, kc_[l], hd, nkv, NH_, kc_[l]->nb[1], hd * kc_[l]->nb[0], 0);
+      ggml_tensor *Vv = ggml_view_3d(ctx, vc_[l], hd, nkv, NH_, vc_[l]->nb[1], hd * vc_[l]->nb[0], 0);
+      // CPU flash attention skips -inf mask cells, so cost follows the ancestor chain, not the tree size.
+      ggml_tensor *a = ggml_flash_attn_ext(ctx, q, K, Vv, mask, 1.f / std::sqrt((float)hd), 0.f, 0.f);
+      a = ggml_reshape_2d(ctx, a, D_, n);
+      a = ggml_add(ctx, ggml_mul_mat(ctx, Wl("blk.%d.attn_output.weight", l), a), Wl("blk.%d.attn_output.bias", l));
+      x = ggml_add(ctx, x, a);
+      h = ggml_norm(ctx, x, 1e-5f);
+      h = ggml_add(ctx, ggml_mul(ctx, h, Wl("blk.%d.ffn_norm.weight", l)), Wl("blk.%d.ffn_norm.bias", l));
+      h = ggml_gelu(ctx, ggml_add(ctx, ggml_mul_mat(ctx, Wl("blk.%d.ffn_up.weight", l), h), Wl("blk.%d.ffn_up.bias", l)));
+      h = ggml_add(ctx, ggml_mul_mat(ctx, Wl("blk.%d.ffn_down.weight", l), h), Wl("blk.%d.ffn_down.bias", l));
+      x = ggml_add(ctx, x, h);
+    }
+    x = ggml_norm(ctx, x, 1e-5f);
+    x = ggml_add(ctx, ggml_mul(ctx, x, W("output_norm.weight")), W("output_norm.bias"));
+    ggml_tensor *logits = ggml_mul_mat(ctx, out_, x);
+    ggml_set_output(x);
+    ggml_set_output(logits);
+    ggml_build_forward_expand(gf, x);
+    ggml_build_forward_expand(gf, logits);
+    ggml_gallocr_alloc_graph(galloc_, gf);
+
+    std::vector<int32_t> tv(n), pv(n);
+    std::vector<float> mv((size_t)nkv * n, -INFINITY);
+    for (int r = 0; r < n; r++) {
+      tv[r] = nodes_[c0 + r].tok;
+      pv[r] = nodes_[c0 + r].pos;
+      for (int c = c0 + r; c >= 0; c = nodes_[c].parent) mv[(size_t)r * nkv + c] = 0.f;
+    }
+    ggml_backend_tensor_set(tok, tv.data(), 0, n * sizeof(int32_t));
+    ggml_backend_tensor_set(pos, pv.data(), 0, n * sizeof(int32_t));
+    std::vector<ggml_fp16_t> mh(mv.size());
+    ggml_fp32_to_fp16_row(mv.data(), mh.data(), (int64_t)mv.size());
+    ggml_backend_tensor_set(mask, mh.data(), 0, mh.size() * sizeof(ggml_fp16_t));
+    ggml_backend_graph_compute(be_, gf);
+
+    const float *hx = (const float *)x->data, *lg = (const float *)logits->data;
+    for (int r = 0; r < n; r++) {
+      Node &nd = nodes_[c0 + r];
+      nd.h.assign(hx + (size_t)r * D_, hx + (size_t)(r + 1) * D_);
+      const float *row = lg + (size_t)r * V_;
+      float mx, sum, neg;
+      vDSP_maxv(row, 1, &mx, V_);
+      neg = -mx;
+      vDSP_vsadd(row, 1, &neg, ebuf_.data(), 1, V_);
+      int nv = V_;
+      vvexpf(ebuf_.data(), ebuf_.data(), &nv);
+      vDSP_sve(ebuf_.data(), 1, &sum, V_);
+      nd.lse = mx + std::log(sum);
+    }
+    ggml_free(ctx);
+    done_ = nkv;
+  }
+
+ private:
+  ggml_tensor *W(const char *n) const {
+    ggml_tensor *t = ggml_get_tensor(rctx_, n);
+    return t ? t : ggml_get_tensor(wctx_, n);
+  }
+
+  struct Node {
+    int parent, pos, tok;
+    float lse;
+    std::vector<float> h;
+  };
+  int L_ = 0, D_ = 0, NH_ = 0, V_ = 0, npos_ = 0, cap_ = 0, done_ = 0;
+  ggml_backend_t be_ = nullptr;
+  ggml_context *wctx_ = nullptr, *rctx_ = nullptr, *kctx_ = nullptr;
+  ggml_backend_buffer_t wbuf_ = nullptr, rbuf_ = nullptr, kbuf_ = nullptr;
+  ggml_gallocr_t galloc_ = nullptr;
+  ggml_tensor *wte_ = nullptr, *wpe_ = nullptr, *out_ = nullptr;
+  std::vector<ggml_tensor *> kc_, vc_;
+  std::vector<Node> nodes_;
+  std::vector<std::string> tokens_;
+  std::vector<char> meta_;
+  std::vector<float> row_, ebuf_;
+};
+
+}  // namespace nova_lm

@@ -36,6 +36,8 @@ struct NovaBlock: Equatable {
   let page: String
   // ↓/↑ 换词时当前用的是这一页的第几个备选（从 1 起），没有时为空。
   let current: Int?
+  // 原样的标记字段，只给界面日志用。
+  let flags: String
 
   // nova_tree 属性：每块一行，格式见 nova_sentences.lua。
   static func parse(tree: String) -> [NovaBlock] {
@@ -47,19 +49,30 @@ struct NovaBlock: Equatable {
                        word: NovaChoice(field: fields.count > 4 ? fields[4] : ""),
                        alternatives: fields.dropFirst(5).map(NovaChoice.init(field:)),
                        page: flags.range(of: #"p\d+/\d+"#, options: .regularExpression).map { String(flags[$0].dropFirst()) } ?? "",
-                       current: flags.range(of: #"h\d+"#, options: .regularExpression).flatMap { Int(flags[$0].dropFirst()) })
+                       current: flags.range(of: #"h\d+"#, options: .regularExpression).flatMap { Int(flags[$0].dropFirst()) },
+                       flags: flags)
     }
   }
 
   // 绿：用户选过。紫：语法推翻了词频（多半是对的）。橙：解码器拿不准。见 nova_sentences.lua 的 measure_block。
   var color: NSColor {
+    switch tone {
+    case "green": NovaPalette.green
+    case "purple": NovaPalette.purple
+    case "orange": NovaPalette.orange
+    default: NovaPalette.blue
+    }
+  }
+
+  // 颜色的名字，界面日志（NovaUILog）记这个。
+  var tone: String {
     if pinned {
-      return NovaPalette.green
+      return "green"
     }
     if corrected {
-      return NovaPalette.purple
+      return "purple"
     }
-    return uncertain ? NovaPalette.orange : NovaPalette.blue
+    return uncertain ? "orange" : "blue"
   }
 }
 
@@ -459,5 +472,33 @@ private extension NovaLayout {
       }
     }
     bottom = style.linear || entries.isEmpty ? rowTop + (entries.isEmpty ? 0 : rowHeight) : rowTop
+  }
+}
+
+// 界面日志：<用户目录>/nova_lm/debug.on 存在时，每次画面板记一行到 nova_lm/ui.log：
+// `时间\t原始字母\t首选\t每块「文字=颜色/标记>第一备选」`，焦点块的颜色记成 focus，没有词块时记 list。
+// 和 nova_lm 插件的 debug.log 对照，就能分清是插件没标还是面板没画；自动测试也读它。会记下打的所有字。
+enum NovaUILog {
+  static let dir = SquirrelApp.userDir.appending(component: "nova_lm", directoryHint: .isDirectory)
+  static let formatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "MM-dd HH:mm:ss.SSS"
+    return formatter
+  }()
+
+  static func record(letters: String, first: String, blocks: [NovaBlock]) {
+    guard FileManager.default.fileExists(atPath: dir.appending(component: "debug.on").path) else { return }
+    let parts = blocks.isEmpty ? ["list"] : blocks.map { block in
+      "\(block.word.text)=\(block.focused ? "focus" : block.tone)/\(block.flags)" + (block.alternatives.first.map { ">" + $0.text } ?? "")
+    }
+    let line = ([formatter.string(from: Date()), letters, first] + parts).joined(separator: "\t") + "\n"
+    let url = dir.appending(component: "ui.log")
+    if let handle = try? FileHandle(forWritingTo: url) {
+      handle.seekToEndOfFile()
+      handle.write(Data(line.utf8))
+      try? handle.close()
+    } else {
+      try? Data(line.utf8).write(to: url)
+    }
   }
 }

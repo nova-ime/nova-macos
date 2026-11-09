@@ -615,6 +615,7 @@ private extension SquirrelInputController {
     content.preedit = preedit
     content.selRange = selRange
     content.blocks = NovaBlock.parse(tree: tree)
+    NovaUILog.record(letters: letters, first: candidates.first ?? preedit, blocks: content.blocks)
     content.letters = letters
     content.cursor = cursor
     content.highlighted = highlighted

@@ -25,3 +25,6 @@ Squirrel-*-official.app/
 official-pkg/
 SharedSupport-removed-from-official/
 .scratch/
+
+# GPT-2 模型和字表（约 111 MB），不进 git；来源见 nova-lm/README.md。
+nova-lm/model/

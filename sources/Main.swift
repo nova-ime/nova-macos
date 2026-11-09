@@ -10,7 +10,11 @@ import InputMethodKit
 
 @main
 struct SquirrelApp {
-  static let userDir = if let pwuid = getpwuid(getuid()) {
+  // 自动测试用单独的用户目录：`defaults write im.nova.inputmethod.NovaSquirrel NovaUserDir <目录>`，
+  // 重启 Nova 后生效；测完要 `defaults delete`，否则平时打的字也记到测试目录。见 .scratch/uitest。
+  static let userDir = if let dir = UserDefaults.standard.string(forKey: "NovaUserDir"), !dir.isEmpty {
+    URL(fileURLWithPath: dir, isDirectory: true)
+  } else if let pwuid = getpwuid(getuid()) {
     URL(fileURLWithFileSystemRepresentation: pwuid.pointee.pw_dir, isDirectory: true, relativeTo: nil).appending(components: "Library", "NovaSquirrel")
   } else {
     try! FileManager.default.url(for: .libraryDirectory, in: .userDomainMask, appropriateFor: nil, create: false).appendingPathComponent("NovaSquirrel", isDirectory: true)

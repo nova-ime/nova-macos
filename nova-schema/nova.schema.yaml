@@ -42,6 +42,8 @@ engine:
     - script_translator
   filters:
     - lua_filter@*nova_sentences
+    # 用 GPT-2 决定哪些块标橙、第一备选是什么，见 nova-lm/nova_lm.cc。插件或模型缺失时原样放行。
+    - nova_lm_filter
     - uniquifier
 
 speller:
@@ -100,3 +102,15 @@ style:
 nova_tree:
   enabled: true
   debug: false
+
+# GPT-2 标橙插件（nova-lm/）。模型和字表由 scripts/install-nova.sh 复制到用户目录的 nova_lm/。
+# tau：块的份额低于它就标橙。26 个领域评测里，0.075 时标橙块 90% 确实写错。
+nova_lm:
+  enabled: true
+  model: nova_lm/gpt2.gguf
+  charmap: nova_lm/charmap.tsv
+  tau: 0.075
+  sentences: 5
+  beam: 5
+  threads: 4
+  context: 30

@@ -46,6 +46,14 @@ fi
 mkdir -p "$USERDIR/lua"
 cp "$ROOT/nova-schema/nova.schema.yaml" "$ROOT/nova-schema/nova_lexicon.txt" "$USERDIR/"
 cp "$ROOT"/nova-schema/lua/*.lua "$USERDIR/lua/"
+# GPT-2 标橙插件的模型和字表（约 111 MB，不进 git）。默认在 nova-lm/model/，可用 NOVA_LM_DIR 指定。
+LM="${NOVA_LM_DIR:-$ROOT/nova-lm/model}"
+if [ -f "$LM/gpt2.gguf" ] && [ -f "$LM/charmap.tsv" ]; then
+  mkdir -p "$USERDIR/nova_lm"
+  cp "$LM/gpt2.gguf" "$LM/charmap.tsv" "$USERDIR/nova_lm/"
+else
+  echo "没找到 GPT-2 模型（$LM/gpt2.gguf、charmap.tsv）：照常安装，但不按 GPT-2 标橙。"
+fi
 
 quit_running
 sleep 1
@@ -61,7 +69,7 @@ if [ -d "$OLD_TARGET" ]; then MOVED=1; rm -rf "$OLD_TARGET"; fi
 open "$TARGET"
 sleep 2
 "$BIN" --reload
-echo "已安装到 $TARGET。在输入法列表里选 Nova 鼠须管，用 F4 切到 Nova 方案，打 nihkuijx。"
+echo "已安装到 ${TARGET}。在输入法列表里选 Nova 鼠须管，用 F4 切到 Nova 方案，打 nihkuijx。"
 if [ "$MOVED" = 1 ]; then
   echo "这次是从 ~/Library/Input Methods 搬过来的：切换列表里可能暂时没有 Nova，注销再登录一次即可。"
 fi
