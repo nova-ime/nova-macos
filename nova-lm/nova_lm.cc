@@ -18,10 +18,24 @@
 // The tree of scored prefixes lives in a KV cache (tree_lm.h), so each keystroke runs only the
 // prefixes it adds. The context is run once, when text is committed.
 //
+// With `repick` on, a block GPT-2 would write differently (its share is below `repick_tau` and
+// another text has a larger share) takes that text: the first candidate and the tree change, and
+// the decoder's text becomes the alternative. Blocks nova_sentences froze (s flag) and blocks the
+// user chose stay as they are. Off unless nova_lm/repick is set; nova.schema.yaml turns it on.
+// Typed key by key over the same 26 domains
+// (repick_tau 0.2): whole sentences right 57.4% -> 77.3%, 1387 sentences fixed and 96 broken of
+// 6486; the last two characters change half as often while typing; p99 per key 11.5 -> 11.7 ms.
+// What is still wrong is then rarely orange (73.7% -> 8.5% of wrong blocks at tau 0.075): sentences
+// that are wrong with no orange on a wrong block go from 9.9% to 20.0%. A simulated user fixing
+// 541 sentences with the real keys presses 1134 -> 870 keys.
+//
 // Schema options (all under nova_lm/): enabled, model (GGUF, relative to the user or shared data
-// directory), charmap (`code \t chars` per line), tau, sentences, beam, threads, context, drop_orange_context, debug.
+// directory), charmap (`code \t chars` per line), tau, sentences, beam, threads, context, drop_orange_context,
+// repick, repick_tau, debug.
 // With debug on, property nova_lm holds the time this filter took and every block's share, and
-// a test can set property nova_lm_history to replace the committed text ("-" for none).
+// a test can set property nova_lm_history to replace the committed text ("-" for none); the
+// environment then overrides repick: NOVA_REPICK=<repick_tau> turns it on, NOVA_REPICK_FROZEN=1
+// lets it change frozen blocks too.
 // Creating nova_lm/debug.on in the user data directory turns on nova_lm/debug.log (see log_line).
 
 #include <rime/candidate.h>
@@ -253,6 +267,15 @@ class NovaLmFilter : public rime::Filter {
       config->GetInt("nova_lm/threads", &threads_);
       config->GetInt("nova_lm/context", &context_chars_);
       config->GetBool("nova_lm/drop_orange_context", &drop_orange_);
+      config->GetBool("nova_lm/repick", &repick_);
+      config->GetDouble("nova_lm/repick_tau", &repick_tau_);
+    }
+    if (debug_) {
+      if (const char *e = getenv("NOVA_REPICK")) {
+        repick_ = true;
+        repick_tau_ = atof(e);
+      }
+      repick_frozen_ = getenv("NOVA_REPICK_FROZEN") != nullptr;
     }
     if (!enabled_) return;
     model_file_ = resolve(model_file_);
@@ -269,6 +292,7 @@ class NovaLmFilter : public rime::Filter {
           for (size_t i = a; i < b; i++) drop[at + i] = true;
       shown_top_.clear();
       shown_orange_.clear();
+      last_ages_.clear();
       u32string dropped;
       for (size_t i = 0; i < text.size(); i++) {
         char32_t c = text[i];
@@ -318,11 +342,12 @@ class NovaLmFilter : public rime::Filter {
     // Take the first candidate and the whole sentences after it; nova_sentences writes the tree
     // while yielding the first one.
     auto head = rime::New<rime::FifoTranslation>();
+    vector<rime::an<rime::Candidate>> taken;
     vector<u32string> sentences;
     for (int i = 0; !translation->exhausted() && i < sentences_; i++) {
       auto cand = translation->Peek();
       if (!cand || (i > 0 && cand->type() != "sentence")) break;
-      head->Append(cand);
+      taken.push_back(cand);
       sentences.push_back(decode(cand->text()));
       translation->Next();
     }
@@ -330,6 +355,7 @@ class NovaLmFilter : public rime::Filter {
     string tree = ctx->get_property("nova_tree");
     shown_top_.clear();
     shown_orange_.clear();
+    swaps_ = 0;
     if (tree.size() > 1) {
       std::lock_guard<std::mutex> lock(g_mutex);
       string out, info;
@@ -344,6 +370,10 @@ class NovaLmFilter : public rime::Filter {
       }
       if (ok) {
         ctx->set_property("nova_tree", out);
+        // Re-picked blocks: the first candidate (what space commits) carries the same text as the tree.
+        if (swaps_ > 0 && !taken.empty())
+          taken[0] = rime::New<rime::SimpleCandidate>(taken[0]->type(), taken[0]->start(), taken[0]->end(),
+                                                      encode(shown_top_), taken[0]->comment(), taken[0]->preedit());
         if (debug_) {
           // first number: GPT-2 work; pull= time the upstream filters took to yield their sentences
           auto t2 = std::chrono::steady_clock::now();
@@ -353,6 +383,7 @@ class NovaLmFilter : public rime::Filter {
         }
       }
     }
+    for (const auto &cand : taken) head->Append(cand);
     return head + translation;
   }
 
@@ -365,6 +396,7 @@ class NovaLmFilter : public rime::Filter {
     vector<string> fields;
     size_t a, b;  // characters [a, b) of the sentence
     bool chosen, focus, aux;  // aux: nova_sentences lists what the typed aux code leaves (x flag)
+    bool frozen, swapped = false;  // frozen: s flag; swapped: re-picked on this key
     float conf = 1.f;
     u32string alt;
   };
@@ -547,6 +579,7 @@ class NovaLmFilter : public rime::Filter {
       blk.chosen = flags[0] == '1';
       blk.focus = flags.find('f') < flags.find('a');
       blk.aux = flags.find('x') < flags.find('a');
+      blk.frozen = flags.find('s') < flags.find('a');
       vector<string> codes = codes_of(blk.fields[3]);
       u32string text = decode(split(blk.fields[4], '\x1f')[0]);
       if (codes.empty() || codes.size() != text.size()) return false;
@@ -587,6 +620,11 @@ class NovaLmFilter : public rime::Filter {
     double z = 0;
     for (const auto &[s, v] : scored) z += std::exp(v - best);
 
+    // nova_sentences counts how long a block has kept its text and freezes it after two syllables.
+    // It decodes a re-picked block back to the decoder's text on every key, so the count for the
+    // re-picked text is kept here: `step` is 1 when a syllable was completed since the last key.
+    if (keys.size() < last_syllables_) last_ages_.clear();
+    int step = keys.size() != last_syllables_ ? 1 : 0;
     for (auto &blk : blocks) {
       if (blk.chosen) continue;
       std::unordered_map<u32string, double> mass;
@@ -614,6 +652,19 @@ class NovaLmFilter : public rime::Filter {
         for (size_t k = 0; k < cur.size(); k++)
           if (blk.alt[k] != cur[k] && norm(u32string(1, blk.alt[k])) == norm(u32string(1, cur[k])))
             blk.alt[k] = cur[k];
+      if (repick_ && !blk.aux && !blk.focus && (!blk.frozen || repick_frozen_) && blk.alt.size() == cur.size() &&
+          blk.conf < repick_tau_ && alt_mass > blk.conf) {
+        top.replace(blk.a, cur.size(), blk.alt);
+        string text = encode(blk.alt);
+        auto age = last_ages_.find(blk.fields[1] + ":" + blk.fields[2] + ":" + text);
+        string &flags = blk.fields[0];
+        flags = flags.substr(0, flags.find('a')) + "a" + std::to_string(age == last_ages_.end() ? 0 : age->second + step);
+        blk.fields[4] = text + "\x1f";  // no share: the word-frequency share was the decoder text's
+        blk.alt = cur;
+        blk.conf = (float)alt_mass;
+        blk.swapped = true;
+        swaps_++;
+      }
     }
 
     // Orange blocks get the GPT-2 alternative first. Overview alternatives share nine number
@@ -643,7 +694,7 @@ class NovaLmFilter : public rime::Filter {
       // purple flag: orange is the measured signal (90% of orange blocks are wrong).
       string kept;
       for (char c : head)
-        if (c != 'o' && c != 'u' && !(c == 'c' && orange(blk))) kept += c;
+        if (c != 'o' && c != 'u' && !(c == 'c' && (orange(blk) || blk.swapped))) kept += c;
       if (blk.aux) {
         flags = kept + (had_overview ? "o" : "") + tail;
         labels += (int)blk.fields.size() - 5;
@@ -655,10 +706,13 @@ class NovaLmFilter : public rime::Filter {
         continue;
       }
       vector<string> alts;
+      string own = split(blk.fields[4], '\x1f')[0];
       if (orange(blk) && !blk.alt.empty()) alts.push_back(encode(blk.alt) + "\x1f\x1f" + blk.fields[2]);
       if (had_overview && (orange(blk) || purple))
-        for (size_t k = 5; k < blk.fields.size() && (int)alts.size() < kAlts; k++)
-          if (split(blk.fields[k], '\x1f')[0] != (blk.alt.empty() ? "" : encode(blk.alt))) alts.push_back(blk.fields[k]);
+        for (size_t k = 5; k < blk.fields.size() && (int)alts.size() < kAlts; k++) {
+          string alt = split(blk.fields[k], '\x1f')[0];
+          if (alt != (blk.alt.empty() ? "" : encode(blk.alt)) && alt != own) alts.push_back(blk.fields[k]);
+        }
       if (any_aux || alts.empty() || labels + (int)alts.size() > kLabels) alts.clear();
       labels += (int)alts.size();
       if (!alts.empty()) kept += 'o';
@@ -672,20 +726,27 @@ class NovaLmFilter : public rime::Filter {
     for (size_t i = 0; i < blocks.size(); i++) {
       if (i) os << '\n';
       for (size_t k = 0; k < blocks[i].fields.size(); k++) os << (k ? "\t" : "") << blocks[i].fields[k];
-      // per block: text=share% ('!' orange, '*' chosen by the user), then /alternative
+      // per block: text=share% ('!' orange, '*' chosen by the user, '^' re-picked), then /alternative
       dbg << ' ' << encode(top.substr(blocks[i].a, blocks[i].b - blocks[i].a)) << (blocks[i].chosen ? "*" : orange(blocks[i]) ? "!" : "")
-          << '=' << (int)(100 * blocks[i].conf);
+          << (blocks[i].swapped ? "^" : "") << '=' << (int)(100 * blocks[i].conf);
       if (!blocks[i].alt.empty()) dbg << '/' << encode(blocks[i].alt);
     }
     dbg << " flags=";  // what the panel gets, block by block
     for (size_t i = 0; i < blocks.size(); i++) dbg << (i ? "," : "") << blocks[i].fields[0];
-    dbg << " tau=" << (int)(1000 * tau_) << "e-3 from=" << beam_from_ << "/" << keys.size() << " nodes=" << m.lm.size() << " sentences=" << scored.size();
+    dbg << " swaps=" << swaps_ << " tau=" << (int)(1000 * tau_) << "e-3 from=" << beam_from_ << "/" << keys.size() << " nodes=" << m.lm.size() << " sentences=" << scored.size();
     for (auto &line : typo_lines) {
       rerank_typo(m, line);
       os << '\n' << line;
     }
     *out = os.str();
     *info = dbg.str();
+    last_ages_.clear();
+    for (const auto &blk : blocks) {
+      const string &flags = blk.fields[0];
+      size_t at = flags.find('a');
+      last_ages_[blk.fields[1] + ":" + blk.fields[2] + ":" + split(blk.fields[4], '\x1f')[0]] = at == string::npos ? 0 : atoi(flags.c_str() + at + 1);
+    }
+    last_syllables_ = keys.size();
     shown_top_ = top;
     for (const auto &blk : blocks)
       if (orange(blk)) shown_orange_.emplace_back(blk.a, blk.b);
@@ -697,6 +758,12 @@ class NovaLmFilter : public rime::Filter {
   double tau_ = 0.075;
   int sentences_ = 5, beam_ = 5, threads_ = 4, context_chars_ = 30;
   bool drop_orange_ = true;  // nova_lm/drop_orange_context
+  bool repick_ = false, repick_frozen_ = false;
+  double repick_tau_ = 0.2;
+  int swaps_ = 0;  // blocks re-picked on the last key
+  // Blocks of the last key (`from:to:text`) and how many syllables each has kept its text.
+  std::unordered_map<string, int> last_ages_;
+  size_t last_syllables_ = 0;
   rime::connection commit_;
   u32string history_;
   // The first sentence of the last key and its orange blocks (offsets into it), for the commit.

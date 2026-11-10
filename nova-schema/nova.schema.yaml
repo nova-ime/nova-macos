@@ -105,8 +105,14 @@ nova_tree:
 
 # GPT-2 标橙插件（nova-lm/）。模型和字表由 scripts/install-nova.sh 复制到用户目录的 nova_lm/。
 # tau：块的份额低于它就标橙。26 个领域评测里，0.075 时标橙块 90% 确实写错。
+# repick：GPT-2 认为某块另一种写法份额更大、而现在这种写法的份额低于 repick_tau 时，直接换成那种写法
+# （冻结的块和用户选过的块不换）。默认开，不多花时间（用的是标橙已经算好的分数）。逐键评测里整句全对
+# 从 57.4% 升到 77.3%，但剩下的错很少再标橙：写错又没有橙色提示的句子从 9.9% 升到 20.0%。
+# 想多看到橙色提示就改成 false。
 nova_lm:
   enabled: true
+  repick: true
+  repick_tau: 0.2
   model: nova_lm/gpt2.gguf
   charmap: nova_lm/charmap.tsv
   tau: 0.075

@@ -4,6 +4,10 @@ librime 滤镜 `nova_lm_filter`，接在 `lua_filter@*nova_sentences` 后面。�
 解码器的前 5 句和 GPT-2 按码逐字 beam 出的 5 句打分，按各块的份额决定哪些块标橙、第一备选是什么。
 做法和评测数字见 `nova_lm.cc` 开头的注释。
 
+`nova_lm/repick: true` 时，GPT-2 还会直接改首选：某块另一种写法的份额更大，就换成那种写法。
+`nova_sentences` 冻结的块（树里的 `s` 标记）和用户选过的块不换。默认开；开了以后剩下的错很少再标橙，
+想多看到橙色提示就在 `nova.schema.yaml` 里改成 `false`。
+
 ## 构建和安装
 
 1. `nova-lm/build.sh`：编出 `lib/rime-plugins/librime-nova-lm.dylib`，并把 ggml 的 CPU 后端复制到

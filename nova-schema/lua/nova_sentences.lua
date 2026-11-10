@@ -183,7 +183,8 @@ end
 -- nova_tree 属性：每块一行，`标记\t起\t止\t键\t文字\t备选...`，起止是段内字节偏移。
 --   标记末尾的 a数字 是这块已经稳定了几个音节，见 frozen_lines。
 --   标记：首字符 1 表示用户选过，0 表示没有；含 f 是焦点块；含 c 是整句解码选了词频较低的词；
---   含 o 是没有焦点时直接显示备选的不确定块，数字键从左到右连续编号；含 u 是解码器拿不准（面板标橙）。
+--   含 o 是没有焦点时直接显示备选的不确定块，数字键从左到右连续编号；含 u 是解码器拿不准（面板标橙）；
+--   含 s 是冻结的块（自动冻结，或选词时冻结的前文），nova_lm_filter 重选首选时不动它。
 --   文字：`文字\31比例`；备选：`文字\31比例\31止[\31起]`，长度可以和块不同；带起点的是只换光标处
 --   一个字的单字备选（起点在块中间）。
 --   比例是在同段候选里占的词频比例，不是真实概率，可以为空。
@@ -191,6 +192,7 @@ end
 --   这样改一处不会让前面的词重新解码；后面的词跟着新选的字重新解码。
 -- nova_pins_end 属性：选词时的输入长度，见 parse_pins。
 -- nova_open_from 属性：`起点:输入`，刚选的词在段内的起点。它后面的块不冻结，见 frozen_lines。
+--   只用一次：选词后重新解码一遍就清掉，之后移动光标整棵树原样保留。
 -- nova_cursor 属性：原始字母光标在整个输入里的位置，空表示在末尾。光标所在的块是焦点，
 --   在末尾时没有焦点。Rime 自己的光标始终在末尾，见 nova_tree_keys。
 
@@ -485,7 +487,8 @@ local function build_blocks(env, tokens, pins, default_text, spans, redecode)
     local before -- 紧挨在前面的固定段
     while i <= n do
         if pins[i] then
-            blocks[#blocks + 1] = { pinned = pins[i].chosen, first = i, last = pins[i].last, text = pins[i].text }
+            blocks[#blocks + 1] = { pinned = pins[i].chosen, frozen = not pins[i].chosen,
+                                    first = i, last = pins[i].last, text = pins[i].text }
             before = { first = i, text = pins[i].text }
             i = pins[i].last + 1
         else
@@ -739,6 +742,7 @@ local function serialize(env, blocks, tokens, offsets, focus, ages, cursor_sylla
         if block.aux_words then flags = flags .. "x" end
         if block.overview then flags = flags .. "o" end
         if block.uncertain then flags = flags .. "u" end
+        if block.frozen then flags = flags .. "s" end
         local from, to = offsets[block.first], offsets[block.last] + #tokens[block.last]
         flags = flags .. "a" .. (ages[from .. ":" .. to .. ":" .. block.text] or 0)
         local fields = { flags, tostring(offsets[block.first]), tostring(offsets[block.last] + #tokens[block.last]),
@@ -899,6 +903,9 @@ local function build_tree(env, tokens, seg, cand, stop)
     -- nova_open_from：`起点:输入`，nova_tree_keys 选词时写，输入变了就失效。
     local open_from, open_input = (context:get_property("nova_open_from") or ""):match("^(%d+):(.*)$")
     open_from = open_input == context.input and tonumber(open_from) or nil
+    -- 只用这一次。不清掉的话，后面的块每次移动光标都重新解码；nova_lm_filter 重选首选时不动焦点块，
+    -- 焦点移上去文字就变回解码器的写法，移开又变回去。
+    if open_from then context:set_property("nova_open_from", "") end
     local frozen = frozen_lines(previous, same_input or stop ~= seg._end, open_from,
                                 context:get_property("nova_tree_groups"))
     local pins = parse_pins(env, tokens, offsets, context.input:sub(seg._start + 1, seg._end), frozen)
