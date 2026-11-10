@@ -29,6 +29,12 @@
 // that are wrong with no orange on a wrong block go from 9.9% to 20.0%. A simulated user fixing
 // 541 sentences with the real keys presses 1134 -> 870 keys.
 //
+// A key that leaves the input as it was (a pick, or Up/Down) makes nova_sentences decode what
+// follows the picked word again, and that can lose a word that was right (范围|跟 -> 范伟|根 with
+// a user dictionary). The sentence of the last key, with the chosen blocks written in, joins the
+// scored sentences on such a key, so GPT-2 decides between the old text and the new decode. Not
+// after [ or ] (nova_redecode): there the user asked for the old characters to go.
+//
 // Schema options (all under nova_lm/): enabled, model (GGUF, relative to the user or shared data
 // directory), charmap (`code \t chars` per line), tau, sentences, beam, threads, context, drop_orange_context,
 // repick, repick_tau, debug.
@@ -293,6 +299,8 @@ class NovaLmFilter : public rime::Filter {
       shown_top_.clear();
       shown_orange_.clear();
       last_ages_.clear();
+      prev_top_.clear();
+      prev_input_.clear();
       u32string dropped;
       for (size_t i = 0; i < text.size(); i++) {
         char32_t c = text[i];
@@ -353,6 +361,14 @@ class NovaLmFilter : public rime::Filter {
     }
     auto t1 = std::chrono::steady_clock::now();
     string tree = ctx->get_property("nova_tree");
+    // nova_redecode is `from:to:input`, valid while the input is the one it was written for.
+    string redecode = ctx->get_property("nova_redecode");
+    size_t colon = redecode.find(':');
+    if (colon != string::npos) colon = redecode.find(':', colon + 1);
+    bool shrunk = colon != string::npos && redecode.substr(colon + 1) == ctx->input();
+    carry_ = ctx->input() == prev_input_ && !shrunk ? prev_top_ : u32string();
+    prev_input_ = ctx->input();
+    prev_top_.clear();
     shown_top_.clear();
     shown_orange_.clear();
     swaps_ = 0;
@@ -596,6 +612,12 @@ class NovaLmFilter : public rime::Filter {
     sentences.erase(std::remove_if(sentences.begin(), sentences.end(), [&](const u32string &s) { return s.size() != top.size(); }),
                     sentences.end());
     if (std::find(sentences.begin(), sentences.end(), top) == sentences.end()) sentences.insert(sentences.begin(), top);
+    if (carry_.size() == top.size()) {  // see the header: the last key's sentence around the chosen blocks
+      u32string carry = carry_;
+      for (const auto &blk : blocks)
+        if (blk.chosen) carry.replace(blk.a, blk.b - blk.a, top, blk.a, blk.b - blk.a);
+      if (std::find(sentences.begin(), sentences.end(), carry) == sentences.end()) sentences.push_back(carry);
+    }
 
     prepare(m);
     for (int attempt = 0;; attempt++) {
@@ -748,6 +770,7 @@ class NovaLmFilter : public rime::Filter {
     }
     last_syllables_ = keys.size();
     shown_top_ = top;
+    prev_top_ = top;
     for (const auto &blk : blocks)
       if (orange(blk)) shown_orange_.emplace_back(blk.a, blk.b);
     return true;
@@ -769,6 +792,9 @@ class NovaLmFilter : public rime::Filter {
   // The first sentence of the last key and its orange blocks (offsets into it), for the commit.
   u32string shown_top_;
   vector<std::pair<size_t, size_t>> shown_orange_;
+  // The input and first sentence of the last key, and that sentence when this key kept the input.
+  string prev_input_;
+  u32string prev_top_, carry_;
   vector<int> context_;
   int tail_ = -1, beam_from_ = 0;
   std::unordered_map<u32string, int> prefixes_;
