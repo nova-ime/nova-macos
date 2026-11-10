@@ -35,6 +35,26 @@
 // scored sentences on such a key, so GPT-2 decides between the old text and the new decode. Not
 // after [ or ] (nova_redecode): there the user asked for the old characters to go.
 //
+// 的/地/得 typed `de` count as one text for the shares, so the decoder's choice among them used to
+// stand: it has 得 right 71.9% of the time and almost never writes 地 (2655 places of the 6486 eval
+// sentences). With repick on, while such a syllable is one of the last three, the sentence is also
+// scored with each of the other two there, and the best one is shown when it beats the decoder's:
+// by any margin toward 地 or 得, by more than 2 nats toward 的. GPT-2 learnt from web text, which
+// writes 的 for all three, so a small lead for 的 over the decoder's 得 is that habit, not grammar
+// (5 of 7 such places wrong by the standard usage, 19 of 19 right above 2 nats), and a small lead for
+// 地 or 得 over 的 goes against the habit (17 of 20 right under 0.5 nats). Two characters after the place are
+// enough: 97.1% of places right by the set's labels (decoder 94.8%; 的 98.2, 地 64.9, 得 89.9), the
+// same with six. Of the 32 changes against a label, 24 are the set writing 的 for 地/得.
+// A `de` that is the last syllable stays out of 地/得: they attach to the word after them, and of
+// the 5 sentences ending so in the replay, 4 were wrong.
+// Further back the character of the last key stays, so text the user has typed past does not
+// change (and a pick, which decodes what follows it again, cannot turn a 的 that was right into 得).
+// Typing the 6486 sentences key by key: 得 right at 73.9 -> 79.4% of its places, 的 97.6 -> 97.8%;
+// 39 sentences fixed and 22 broken by the set's labels, 14 of the 22 being the set writing 的 where
+// the standard usage is 地/得; a 的/地/得 more than three characters back changed 61 -> 1 times.
+// With the particle 地 typed `de` (41 sentences, the set types it `di`): 9.5 -> 64.3% of 42 places.
+// Per-key time unchanged (541 sentences, mean 5.1 ms, p99 11.3 ms either way).
+//
 // Schema options (all under nova_lm/): enabled, model (GGUF, relative to the user or shared data
 // directory), charmap (`code \t chars` per line), tau, sentences, beam, threads, context, drop_orange_context,
 // repick, repick_tau, debug.
@@ -62,6 +82,7 @@
 #include <sys/stat.h>
 
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 
 #include <algorithm>
@@ -126,6 +147,9 @@ static u32string norm(u32string s) {
   }
   return s;  // 其它 becomes 其他 through 它
 }
+
+static const char32_t kDe[] = {U'的', U'地', U'得'};
+static bool is_de(char32_t c) { return c == U'的' || c == U'地' || c == U'得'; }
 
 static vector<string> split(const string &s, char sep) {
   vector<string> out;
@@ -282,6 +306,10 @@ class NovaLmFilter : public rime::Filter {
         repick_tau_ = atof(e);
       }
       repick_frozen_ = getenv("NOVA_REPICK_FROZEN") != nullptr;
+      if (const char *e = getenv("NOVA_DE_MARGIN")) {  // `to 地/得[,to 的]`; negative: leave 的/地/得 alone
+        de_margin_ = (float)atof(e);
+        if (const char *comma = strchr(e, ',')) de_margin_plain_ = (float)atof(comma + 1);
+      }
     }
     if (!enabled_) return;
     model_file_ = resolve(model_file_);
@@ -300,6 +328,7 @@ class NovaLmFilter : public rime::Filter {
       shown_orange_.clear();
       last_ages_.clear();
       prev_top_.clear();
+      last_top_.clear();
       prev_input_.clear();
       u32string dropped;
       for (size_t i = 0; i < text.size(); i++) {
@@ -368,10 +397,12 @@ class NovaLmFilter : public rime::Filter {
     bool shrunk = colon != string::npos && redecode.substr(colon + 1) == ctx->input();
     carry_ = ctx->input() == prev_input_ && !shrunk ? prev_top_ : u32string();
     prev_input_ = ctx->input();
+    last_top_ = prev_top_;
     prev_top_.clear();
     shown_top_.clear();
     shown_orange_.clear();
     swaps_ = 0;
+    retexted_ = false;
     if (tree.size() > 1) {
       std::lock_guard<std::mutex> lock(g_mutex);
       string out, info;
@@ -386,8 +417,8 @@ class NovaLmFilter : public rime::Filter {
       }
       if (ok) {
         ctx->set_property("nova_tree", out);
-        // Re-picked blocks: the first candidate (what space commits) carries the same text as the tree.
-        if (swaps_ > 0 && !taken.empty())
+        // Re-picked blocks and 的/地/得: the first candidate (what space commits) carries the same text as the tree.
+        if (retexted_ && !taken.empty())
           taken[0] = rime::New<rime::SimpleCandidate>(taken[0]->type(), taken[0]->start(), taken[0]->end(),
                                                       encode(shown_top_), taken[0]->comment(), taken[0]->preedit());
         if (debug_) {
@@ -413,6 +444,7 @@ class NovaLmFilter : public rime::Filter {
     size_t a, b;  // characters [a, b) of the sentence
     bool chosen, focus, aux;  // aux: nova_sentences lists what the typed aux code leaves (x flag)
     bool frozen, swapped = false;  // frozen: s flag; swapped: re-picked on this key
+    bool de = false;  // a 的/地/得 of the block is not the decoder's, see the header
     float conf = 1.f;
     u32string alt;
   };
@@ -609,9 +641,32 @@ class NovaLmFilter : public rime::Filter {
       blocks.push_back(std::move(blk));
     }
     if (blocks.empty() || top.size() + context_.size() + 2 > (size_t)m.lm.max_pos()) return false;
+    const u32string given = top;  // the tree's text, before anything here changes it
+    // 的/地/得, see the header. `recent` are the places still open to GPT-2.
+    vector<std::pair<size_t, Block *>> recent;
+    if (repick_ && de_margin_ >= 0)
+      for (auto &blk : blocks) {
+        if (blk.chosen || blk.aux || blk.focus || blk.frozen) continue;
+        for (size_t k = blk.a; k < blk.b; k++) {
+          if (keys[k] != "de" || !is_de(top[k])) continue;
+          if (k + kDeWindow >= top.size()) {
+            recent.emplace_back(k, &blk);
+          } else if (k < last_top_.size() && is_de(last_top_[k]) && last_top_[k] != top[k]) {
+            top[k] = last_top_[k];
+            blk.de = true;
+          }
+        }
+      }
     sentences.erase(std::remove_if(sentences.begin(), sentences.end(), [&](const u32string &s) { return s.size() != top.size(); }),
                     sentences.end());
     if (std::find(sentences.begin(), sentences.end(), top) == sentences.end()) sentences.insert(sentences.begin(), top);
+    for (const auto &[k, blk] : recent)
+      for (char32_t c : kDe)
+        if (c != top[k]) {
+          u32string v = top;
+          v[k] = c;
+          if (std::find(sentences.begin(), sentences.end(), v) == sentences.end()) sentences.push_back(std::move(v));
+        }
     if (carry_.size() == top.size()) {  // see the header: the last key's sentence around the chosen blocks
       u32string carry = carry_;
       for (const auto &blk : blocks)
@@ -647,8 +702,37 @@ class NovaLmFilter : public rime::Filter {
     // re-picked text is kept here: `step` is 1 when a syllable was completed since the last key.
     if (keys.size() < last_syllables_) last_ages_.clear();
     int step = keys.size() != last_syllables_ ? 1 : 0;
+    // A block whose text is not the decoder's: the count goes on from the last key, and the
+    // word-frequency share goes, it was the decoder text's.
+    auto retext = [&](Block &blk, const u32string &t) {
+      string text = encode(t);
+      auto age = last_ages_.find(blk.fields[1] + ":" + blk.fields[2] + ":" + text);
+      string &flags = blk.fields[0];
+      flags = flags.substr(0, flags.find('a')) + "a" + std::to_string(age == last_ages_.end() ? 0 : age->second + step);
+      blk.fields[4] = text + "\x1f";
+    };
+    {
+      const u32string decoded = top;  // each place is judged against the decoder's sentence
+      float mine = scored[decoded];
+      for (const auto &[k, blk] : recent) {
+        float most = -INFINITY;
+        for (char32_t c : kDe) {
+          u32string v = decoded;
+          v[k] = c;
+          auto it = scored.find(v);
+          if (c == decoded[k] || it == scored.end()) continue;
+          if (c != U'的' && k + 1 == decoded.size()) continue;  // 地 and 得 go before a word: not yet typed, not yet judged
+          if (it->second > mine + (c == U'的' ? de_margin_plain_ : de_margin_) && it->second > most) {
+            most = it->second;
+            top[k] = c;
+            blk->de = true;
+          }
+        }
+      }
+    }
     for (auto &blk : blocks) {
       if (blk.chosen) continue;
+      if (blk.de) retext(blk, top.substr(blk.a, blk.b - blk.a));
       std::unordered_map<u32string, double> mass;
       std::unordered_map<u32string, std::pair<double, u32string>> shown;  // class -> (weight, text)
       for (const auto &[s, v] : scored) {
@@ -677,11 +761,7 @@ class NovaLmFilter : public rime::Filter {
       if (repick_ && !blk.aux && !blk.focus && (!blk.frozen || repick_frozen_) && blk.alt.size() == cur.size() &&
           blk.conf < repick_tau_ && alt_mass > blk.conf) {
         top.replace(blk.a, cur.size(), blk.alt);
-        string text = encode(blk.alt);
-        auto age = last_ages_.find(blk.fields[1] + ":" + blk.fields[2] + ":" + text);
-        string &flags = blk.fields[0];
-        flags = flags.substr(0, flags.find('a')) + "a" + std::to_string(age == last_ages_.end() ? 0 : age->second + step);
-        blk.fields[4] = text + "\x1f";  // no share: the word-frequency share was the decoder text's
+        retext(blk, blk.alt);
         blk.alt = cur;
         blk.conf = (float)alt_mass;
         blk.swapped = true;
@@ -748,9 +828,9 @@ class NovaLmFilter : public rime::Filter {
     for (size_t i = 0; i < blocks.size(); i++) {
       if (i) os << '\n';
       for (size_t k = 0; k < blocks[i].fields.size(); k++) os << (k ? "\t" : "") << blocks[i].fields[k];
-      // per block: text=share% ('!' orange, '*' chosen by the user, '^' re-picked), then /alternative
+      // per block: text=share% ('!' orange, '*' chosen by the user, '^' re-picked, '~' 的/地/得 changed), then /alternative
       dbg << ' ' << encode(top.substr(blocks[i].a, blocks[i].b - blocks[i].a)) << (blocks[i].chosen ? "*" : orange(blocks[i]) ? "!" : "")
-          << (blocks[i].swapped ? "^" : "") << '=' << (int)(100 * blocks[i].conf);
+          << (blocks[i].swapped ? "^" : "") << (blocks[i].de ? "~" : "") << '=' << (int)(100 * blocks[i].conf);
       if (!blocks[i].alt.empty()) dbg << '/' << encode(blocks[i].alt);
     }
     dbg << " flags=";  // what the panel gets, block by block
@@ -771,6 +851,7 @@ class NovaLmFilter : public rime::Filter {
     last_syllables_ = keys.size();
     shown_top_ = top;
     prev_top_ = top;
+    retexted_ = top != given;
     for (const auto &blk : blocks)
       if (orange(blk)) shown_orange_.emplace_back(blk.a, blk.b);
     return true;
@@ -795,6 +876,10 @@ class NovaLmFilter : public rime::Filter {
   // The input and first sentence of the last key, and that sentence when this key kept the input.
   string prev_input_;
   u32string prev_top_, carry_;
+  u32string last_top_;  // the first sentence of the last key, whatever its input was
+  float de_margin_ = 0.f, de_margin_plain_ = 2.f;  // nats toward 地/得 and toward 的, see the header; NOVA_DE_MARGIN with debug
+  bool retexted_ = false;  // this key's first sentence is not the tree's text
+  static constexpr size_t kDeWindow = 3;  // a `de` syllable is open while it is one of the last three
   vector<int> context_;
   int tail_ = -1, beam_from_ = 0;
   std::unordered_map<u32string, int> prefixes_;

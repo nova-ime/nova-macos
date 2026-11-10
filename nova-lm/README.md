@@ -8,6 +8,8 @@ librime 滤镜 `nova_lm_filter`，接在 `lua_filter@*nova_sentences` 后面。�
 `nova_sentences` 冻结的块（树里的 `s` 标记）和用户选过的块不换。默认开；开了以后剩下的错很少再标橙，
 想多看到橙色提示就在 `nova.schema.yaml` 里改成 `false`。
 
+重选打开时，按 `de` 打出的「的/地/得」也由 GPT-2 来定：这个音节还在最后三个音节之内时，三种写法各算一遍分，分高的显示出来。改成「地/得」只要分更高，改回「的」要高出 2 nats（GPT-2 学的网页文本习惯全写「的」）。`de` 是最后一个音节时不改成「地/得」。再往前的字保持上一键的写法，不再变。
+
 ## 构建和安装
 
 1. `nova-lm/build.sh`：编出 `lib/rime-plugins/librime-nova-lm.dylib`，并把 ggml 的 CPU 后端复制到
