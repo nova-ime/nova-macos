@@ -495,10 +495,25 @@ class NovaLmFilter : public rime::Filter {
   }
 
   // Log-probability of a whole sentence. Every proper prefix must be in the tree and flushed.
-  float score(Model &m, const u32string &s) {
+  //
+  // A Chinese character outside the vocabulary is scored as [UNK], which stands for every such
+  // character at once and so gets far more probability than any one of them deserves: 奀我知道了
+  // beat 嗯我知道了. Such a character counts as kUnseen at most, below any in-vocabulary homophone,
+  // so it stays only where every candidate has one. `words` exempts the characters the decoder put
+  // there inside a word of two or more (暴殄天物, 山莨菪碱): the dictionary vouches for those.
+  float score(Model &m, const u32string &s, const u32string *words = nullptr) {
     float total = 0;
-    for (size_t k = 0; k < s.size(); k++) total += m.lm.logp(node(m, s.substr(0, k)), token(m, s[k]));
+    for (size_t k = 0; k < s.size(); k++) {
+      int tok = token(m, s[k]);
+      float lp = m.lm.logp(node(m, s.substr(0, k)), tok);
+      bool unseen = tok == m.unk && is_han(s[k]) && !(words && k < words->size() && (*words)[k] == s[k]);
+      total += unseen ? std::min(lp, kUnseen) : lp;
+    }
     return total;
+  }
+  static constexpr float kUnseen = -20.f;  // nats
+  static bool is_han(char32_t c) {
+    return (c >= 0x3400 && c <= 0x9fff) || (c >= 0xf900 && c <= 0xfaff) || (c >= 0x20000 && c <= 0x3ffff);
   }
 
   // Typo fixes from nova_sentences come as alternatives of the t line, each
@@ -689,7 +704,10 @@ class NovaLmFilter : public rime::Filter {
 
     // Sentence scores: decoder sentences and full-length beam sentences, without duplicates.
     std::unordered_map<u32string, float> scored;
-    for (const auto &s : sentences) scored.emplace(s, score(m, s));
+    u32string words(top.size(), U'\0');  // see score()
+    for (const auto &blk : blocks)
+      if (blk.b - blk.a > 1) words.replace(blk.a, blk.b - blk.a, top, blk.a, blk.b - blk.a);
+    for (const auto &s : sentences) scored.emplace(s, score(m, s, &words));
     if (beams_.size() == top.size() + 1)
       for (const auto &b : beams_.back()) scored.emplace(b.text, b.score);
     float best = -INFINITY;

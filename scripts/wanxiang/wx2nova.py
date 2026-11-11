@@ -22,7 +22,9 @@ FINAL = {
     "v": "v", "ou": "b", "in": "n", "ian": "m", "a": "a", "e": "e", "i": "i", "u": "u",
 }
 ZERO = {"a": "aa", "ai": "ai", "an": "an", "ang": "ah", "ao": "ao", "e": "ee", "ei": "ei",
-        "en": "en", "eng": "eg", "er": "er", "o": "oo", "ou": "ou"}
+        "en": "en", "eng": "eg", "er": "er", "o": "oo", "ou": "ou",
+        # 万象把「嗯」「呣」标成没有韵母的 n、ng、m；双拼里没有这种音节，按习惯的打法放。
+        "n": "en", "ng": "en", "m": "mu"}
 
 
 def shuangpin(py):
