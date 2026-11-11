@@ -1143,13 +1143,24 @@ local function func(input, env)
     local composition = env.engine.context.composition
     local seg = not composition:empty() and composition:back() or nil
     local tokens, pending
-    if seg then tokens, pending = syllables(env.engine.context.input:sub(seg._start + 1, seg._end)) end
+    -- 只有拼音段出树。日期（orq）这类由 recognizer 认出的段，字母碰巧也能切成音节。
+    if seg and seg:has_tag("abc") then
+        tokens, pending = syllables(env.engine.context.input:sub(seg._start + 1, seg._end))
+    end
     local stop = seg and seg._end - #(pending or "")
     local context = env.engine.context
+    -- nova_tree_keys 删了用户词之后写 nova_flush：缓存里还有那个词，清掉。
+    if (context:get_property("nova_flush") or "") ~= "" then
+        context:set_property("nova_flush", "")
+        env.cache, env.cache_size, env.weights, env.decoded = {}, 0, {}, {}
+        env.raw, env.raw_size = {}, 0
+    end
     local first = true
     local pinned = false
     for cand in input:iter() do
         local shown = cand
+        -- 自定义短语（nova_phrases）排在第一位时不出树：面板显示普通列表，短语后面是拼音的候选。
+        if first and cand.type == "nova_phrase" then tokens = nil end
         if first and env.tree_enabled then
             local tree = ""
             -- 首选停在一个不成立的音节前：后面全部当原样字母，前面照常出树。

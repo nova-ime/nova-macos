@@ -12,6 +12,8 @@
 -- 空格不管光标在哪都上屏整句；末尾有半个音节时上屏前面的完整部分，见 commit_before_pending。
 -- ; 等于数字 1。有焦点时 [ / ] 伸缩焦点块：[ 让出最后一个音节给右边的块，] 让出第一个音节给左边的块，
 -- 让出的音节和那个相邻块一起单独解码，见 shrink。没有焦点时 [ ] 照常是标点。
+-- Shift+Delete 或 Control+Delete（Control+K 经 key_binder 变成前者）：把焦点块的词从用户词库里删掉，
+-- 没有焦点时删最后一块，见 delete_word。
 
 local LEFT, RIGHT, SPACE = 0xff51, 0xff53, 0x20
 local HOME, END, BACKSPACE, DELETE = 0xff50, 0xff57, 0xff08, 0xffff
@@ -104,6 +106,9 @@ end
 local function init(env)
     local ctx = env.engine.context
     env.enabled = env.engine.schema.config:get_bool("nova_tree/enabled") or false
+    -- 只用来删用户词（delete_word）。和翻译器共用同一个用户词库；不设 memorize 回调，上屏时不会重复记词。
+    local ok, memory = pcall(Memory, env.engine, env.engine.schema, "translator")
+    env.memory = ok and memory or nil
     env.commit = ctx.commit_notifier:connect(clear)
     env.update = ctx.update_notifier:connect(function(c)
         if not c:is_composing() then clear(c) end
@@ -353,6 +358,80 @@ local function shrink(env, seg, blocks, focus, keep_front)
     ctx:refresh_non_confirmed_composition()
 end
 
+-- 用户词库里的词条：键是 `音节;辅助码 音节;辅助码 <Tab>文字`。找出文字是 text、每个音节的双拼和 pairs
+-- 一一对上的词条，标成已删除（librime 的 UpdateEntry(entry, -1)）。返回删了几条。
+-- 只能按键的前缀查，所以用第一个音节查出一批再筛。
+local function forget(env, pairs, text)
+    local memory = env.memory
+    if not memory or not memory:user_lookup(pairs[1] .. ";", true) then return 0 end
+    local found = {}
+    for entry in memory:iter_user() do
+        if entry.text == text then
+            local i, same = 0, true
+            for syllable in entry.custom_code:gmatch("%S+") do
+                i = i + 1
+                if syllable:match("^[^;]*") ~= pairs[i] then same = false break end
+            end
+            if same and i == #pairs then found[#found + 1] = entry end
+        end
+    end
+    for _, entry in ipairs(found) do memory:update_userdict(entry, -1, "") end
+    return #found
+end
+
+-- 删词：把焦点块（没有焦点时是最后一块）的词从用户词库里删掉，这一块当场重新解码。
+-- 学到的更长的词如果盖住这一块、文字又和现在显示的一样（学了「范伟根」，块是「范伟」），一起删：
+-- 不删的话解码器下次还是用它写出同样的字。词库自带的词删不掉，只是去掉了学到的那份优先。
+-- 其他块原样固定；nova_redecode 让这一块单独解码，nova_lm_filter 看到它也不会把删掉的写法带回来。
+local MAX_WORD_SYLLABLES = 6  -- 和 nova_sentences 查词的最长词一致
+
+local function delete_word(env, seg, blocks, focus)
+    local ctx = env.engine.context
+    local target = blocks[focus or #blocks]
+    if not target then return end
+    local input = ctx.input:sub(seg._start + 1, seg._end)
+    -- 每个音节的双拼、显示的字，以及它属于哪一块。
+    local pairs, chars, first, last = {}, {}, nil, nil
+    for _, range in ipairs(syllable_ranges(input)) do
+        for _, block in ipairs(blocks) do
+            if range[1] >= block.from and range[2] <= block.to then
+                local char = block_chars(input, block, range[1], range[2])
+                if not char then return end
+                pairs[#pairs + 1] = input:sub(range[1] + 1, range[1] + 2)
+                chars[#chars + 1] = char
+                if block == target then
+                    first = first or #pairs
+                    last = #pairs
+                end
+            end
+        end
+    end
+    if not first then return end
+    -- 刚上屏的词还在 librime 的待写缓冲里（下一次上屏才写进词库），查不到也删不掉：先写进去。
+    if env.memory then env.memory:finish_session() end
+    local deleted = 0
+    for from = math.max(1, last - MAX_WORD_SYLLABLES + 1), first do
+        for to = last, math.min(#pairs, from + MAX_WORD_SYLLABLES - 1) do
+            deleted = deleted + forget(env, { table.unpack(pairs, from, to) }, table.concat(chars, "", from, to))
+        end
+    end
+    if deleted == 0 then return end
+    local pins = {}
+    for _, block in ipairs(blocks) do
+        if block ~= target then
+            pins[#pins + 1] = pin_line(input, block.from, block.to, block.chosen and "h" or "s", block.text)
+        end
+    end
+    ctx:set_property("nova_pins", table.concat(pins))
+    ctx:set_property("nova_pins_end", tostring(#input))
+    ctx:set_property("nova_open_from", target.from .. ":" .. ctx.input)
+    ctx:set_property("nova_redecode", target.from .. ":" .. target.to .. ":" .. ctx.input)
+    ctx:set_property("nova_cycle", "")
+    ctx:set_property("nova_alt_page", "")
+    ctx:set_property("nova_flush", "1")
+    ctx:refresh_non_confirmed_composition()
+end
+
 -- 翻焦点块的备选。页码带着光标和输入，换了位置就回到第一页；页数上限由 nova_sentences 收住。
 local function turn_page(ctx, step)
     local cursor = cursor_of(ctx)
@@ -394,10 +473,20 @@ local function is_code_letter(code)
 end
 
 local function func(key, env)
-    if not env.enabled or key:release() or key:ctrl() or key:alt() or key:super() then return 2 end
+    if not env.enabled or key:release() or key:alt() or key:super() then return 2 end
     local code = key.keycode
     local ctx = env.engine.context
     if not ctx:is_composing() then return 2 end
+    -- 删词。显示普通列表时（没有树，或用户在翻页）交给 Rime 自己删高亮的候选。
+    if code == DELETE and (key:ctrl() or key:shift()) then
+        local tree = ctx:get_property("nova_tree") or ""
+        local seg = ctx.composition:back()
+        if tree == "" or seg.selected_index > 0 or seg.menu:prepare(1) == 0 then return 2 end
+        local blocks, focus = parse_tree(tree)
+        delete_word(env, seg, blocks, focus)
+        return 1
+    end
+    if key:ctrl() then return 2 end
     local cursor, focused = cursor_of(ctx)
     local inside = cursor < #ctx.input
     -- 光标在末尾但焦点在最后一块时，接着打字就是普通输入，先取消焦点。

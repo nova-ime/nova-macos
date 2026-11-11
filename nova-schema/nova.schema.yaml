@@ -40,6 +40,8 @@ engine:
   translators:
     - punct_translator
     - script_translator
+    # 日期时间（orq、osj、oxq）和自定义短语（用户目录下的 nova_phrases.txt）。
+    - lua_translator@*nova_phrases
   filters:
     - lua_filter@*nova_sentences
     # 用 GPT-2 决定哪些块标橙、第一备选是什么，见 nova-lm/nova_lm.cc。插件或模型缺失时原样放行。
@@ -69,14 +71,22 @@ translator:
 key_binder:
   import_preset: default
 
+# 用 symbols 而不是 default：多了 /fh、/sx 这类符号表（打 / 加字母），
+# 用户在 symbols.custom.yaml 里对标点的改动也会生效。
 punctuator:
-  import_preset: default
+  import_preset: symbols
 
 # 不继承 default 的 uppercase 规则：它不锚定开头，会把音节后的大写字母切成英文段。
+# 邮箱和网址整段原样上屏，不当拼音解码。网址只认 www. 和 http: 这类开头：
+# default 里的「字母.字母」规则会把句号后面接着打的字也算进去。
 recognizer:
   patterns:
     punct: '^/([0-9]0?|[A-Za-z]+)$'
     uppercase: "^[A-Z][-_+.'0-9A-Za-z]*$"
+    email: "^[A-Za-z][-_.0-9A-Za-z]*@.*$"
+    url: "^(www[.]|https?:|ftp[.:]|mailto:|file:).*$"
+    # 日期 orq、时间 osj、星期 oxq，见 lua/nova_phrases.lua。or、os、ox 在自然码里不是音节。
+    date: "^o(rq|sj|xq)$"
 
 # 语法模型：整句排序靠它。
 # 参数照万象 README 推荐的设置。
