@@ -90,6 +90,20 @@ struct NovaContent {
   // 原始字母和光标位置（第几个字母之前）。空表示不显示字母行。
   var letters = ""
   var cursor = 0
+  // 全拼时 letters 是拼音，而光标和词块范围是双拼编码里的位置：letterMap[编码位置] = 拼音位置。
+  // 空表示 letters 就是编码。
+  var letterMap = [Int]()
+
+  func letterPosition(_ code: Int) -> Int {
+    guard !letterMap.isEmpty else { return code }
+    return letterMap[min(max(code, 0), letterMap.count - 1)]
+  }
+
+  // 拼音位置对应的编码位置：第一个拼音位置不小于它的编码位置，也就是落到所在音节的末尾。
+  func codePosition(_ letter: Int) -> Int {
+    guard !letterMap.isEmpty else { return letter }
+    return letterMap.firstIndex { $0 >= letter } ?? letterMap.count - 1
+  }
   var candidates = [NovaCandidate]()
   var highlighted = 0
 }
@@ -278,20 +292,23 @@ private extension NovaLayout {
     let line = baseline(of: rect, font: letterFont)
     // 字母是白色，铺一块深色底，在浅色窗口上也看得见。
     boxes.append(Box(rect: rect.insetBy(dx: -Self.chipPadding, dy: 0), radius: Self.chipRadius, color: NovaPalette.altFill))
-    let covered = Set(content.blocks.flatMap { Array($0.from..<max($0.from, $0.to)) })
+    let covered = Set(content.blocks.flatMap { block in
+      Array(content.letterPosition(block.from)..<max(content.letterPosition(block.from), content.letterPosition(block.to)))
+    })
     for (index, letter) in letters.enumerated() {
       let x = rect.minX + CGFloat(index) * width
       runs.append(Run(string: string(String(letter), letterFont, covered.contains(index) ? NovaPalette.primary : NovaPalette.dim),
                       x: x, baseline: line))
       // 光标落在点的字母后面：焦点按光标前一个字母算。
-      hits.append(Hit(rect: NSRect(x: x, y: rect.minY, width: width, height: rect.height), action: .cursor(index + 1)))
+      hits.append(Hit(rect: NSRect(x: x, y: rect.minY, width: width, height: rect.height), action: .cursor(content.codePosition(index + 1))))
     }
     for block in content.blocks where block.to > block.from {
-      let x = rect.minX + CGFloat(block.from) * width
-      boxes.append(Box(rect: NSRect(x: x + 1, y: rect.maxY - 5, width: CGFloat(block.to - block.from) * width - 2, height: 2),
+      let from = content.letterPosition(block.from), to = content.letterPosition(block.to)
+      let x = rect.minX + CGFloat(from) * width
+      boxes.append(Box(rect: NSRect(x: x + 1, y: rect.maxY - 5, width: CGFloat(to - from) * width - 2, height: 2),
                        radius: 0, color: block.focused ? NovaPalette.focus : block.color))
     }
-    let cursorX = rect.minX + CGFloat(min(max(content.cursor, 0), letters.count)) * width
+    let cursorX = rect.minX + CGFloat(min(max(content.letterPosition(content.cursor), 0), letters.count)) * width
     boxes.append(Box(rect: NSRect(x: cursorX - 1, y: rect.minY + 3, width: 2, height: rect.height - 6), radius: 1, color: NovaPalette.focus))
     right = max(right, rect.maxX + Self.chipPadding)
     bottom += rowHeight

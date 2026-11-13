@@ -3,6 +3,8 @@
 -- script_translator 只给一条整句，后面都是开头的词。这里对每个音节位置查词，
 -- 用词频做 beam search，得到几条完整读法。首选仍是翻译器（带语法模型）的结果。
 
+local bounds = require("nova_bounds")
+
 local MAX_WORD_SYLLABLES = 6   -- 一次查询覆盖的最长词
 local WORDS_PER_SPAN = 6       -- 每段保留的词数
 local BEAM = 8                 -- 每个位置保留的路径数
@@ -658,7 +660,8 @@ local function measure_block(env, block, tokens)
         block.share = 0
     end
     block.corrected = false
-    if block.share then
+    -- 学到的切法（apply_bounds）是用户定的，词频低也不算选错，不列备选。
+    if block.share and not block.learned then
         for text in pairs(weights) do
             if text ~= block.text and (share_of(weights, text) or 0) > block.share then block.corrected = true; break end
         end
@@ -894,6 +897,55 @@ local function choose_by_aux(env, blocks, tokens, offsets)
     context:set_property("nova_pins", table.concat(kept) .. table.concat(chosen))
 end
 
+-- 学到的边界：用户用 [ ] 伸缩过再上屏的切法（nova_bounds）。一串连着的块，编码正好是某条学过的
+-- 左右两块、两头又都落在块的边界上时，换成学到的两块，标成冻结（nova_lm_filter 不再改它）。
+-- 里面有用户这次选过的块就不动；带辅助码的也不动，那是用户在筛字。
+-- 返回这次对上的条目，每行 `边界的字节偏移:左编码:右编码`，写进 nova_bounds_used：
+-- 上屏时 nova_tree_keys 看这条边界还在不在，不在了就把它忘掉。
+local function pair_code(tokens, first, last)
+    local parts = {}
+    for k = first, last do
+        if #tokens[k] ~= 2 then return nil end
+        parts[#parts + 1] = tokens[k]
+    end
+    return table.concat(parts)
+end
+
+local function apply_bounds(blocks, tokens, offsets)
+    local used, p = {}, 1
+    while p <= #blocks do
+        local first, step = blocks[p].first, 1
+        for _, entry in ipairs(bounds.starting_with(tokens[first]:sub(1, 2)) or {}) do
+            local middle = first + #entry.left // 2
+            local last = middle + #entry.right // 2 - 1
+            local q = p
+            while blocks[q] and blocks[q].last < last do q = q + 1 end
+            if blocks[q] and blocks[q].last == last and pair_code(tokens, first, middle - 1) == entry.left
+                and pair_code(tokens, middle, last) == entry.right then
+                local chosen = false
+                for k = p, q do chosen = chosen or blocks[k].pinned end
+                local same = q == p + 1 and blocks[p].last == middle - 1
+                if not chosen and not same then
+                    for _ = p, q do table.remove(blocks, p) end
+                    table.insert(blocks, p, { pinned = false, frozen = true, learned = true, first = middle, last = last, text = entry.rtext })
+                    table.insert(blocks, p, { pinned = false, frozen = true, learned = true, first = first, last = middle - 1, text = entry.ltext })
+                    same = true
+                elseif same and blocks[p].text == entry.ltext and blocks[q].text == entry.rtext then
+                    -- 上一键换好的，或解码器自己就这么切、字也一样：照样算学到的。
+                    for k = p, q do
+                        if not blocks[k].pinned then blocks[k].frozen, blocks[k].learned = true, true end
+                    end
+                end
+                used[#used + 1] = string.format("%d:%s:%s\n", offsets[middle], entry.left, entry.right)
+                if same then step = 2 end
+                break
+            end
+        end
+        p = p + step
+    end
+    return table.concat(used)
+end
+
 -- 返回 nova_tree 属性，以及要替换首选时的新候选。
 local function build_tree(env, tokens, seg, cand, stop)
     local context = env.engine.context
@@ -923,6 +975,7 @@ local function build_tree(env, tokens, seg, cand, stop)
     end
     local blocks = build_blocks(env, tokens, pins, default_text, spans, redecode)
     if not blocks then return nil end
+    context:set_property("nova_bounds_used", apply_bounds(blocks, tokens, offsets))
     -- 树原样保留时（输入没变、只多了半个音节）分组也不变。
     if not same_input and stop == seg._end then
         local groups = {}

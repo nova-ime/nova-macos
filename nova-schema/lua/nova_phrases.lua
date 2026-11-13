@@ -6,6 +6,11 @@
 -- 自定义短语：用户目录下的 nova_phrases.txt，每行 `文字<Tab>编码`，和 Rime 的 custom_phrase.txt 同一格式
 -- （第三列权重可有可无，这里不用）。整段输入正好等于某个编码时，短语排在第一位，后面照常是拼音的候选。
 -- 编码只能是小写字母。文件改了不用重新部署：打字时最多每 2 秒看一次文件，内容变了就重读。
+--
+-- 符号表：o 加类别名，如 ofh 符号、osx 数学，和 /fh、/sx 是同一份表（punctuator/symbols）。
+-- 用户把 / 设成直接上屏顿号时 /fh 进不去，所以另给一个字母的入口。o 后面除了 o、u 都不成音节，
+-- 不会和打字冲突；类别名以 o、u 开头的（/oe、/ue 这几组拉丁字母）和数字的（/1）因此没有 o 的入口。
+-- orq、osj、oxq 先出日期时间，后面接 /rq、/sj、/xq 的符号。
 
 local PHRASE_FILE = "nova_phrases.txt"
 local CHECK_SECONDS = 2
@@ -82,9 +87,30 @@ local function load_phrases(env)
     env.phrases = parse_phrases(content)
 end
 
+-- { ["ofh"] = { "©", "®", ... } }，取自方案的 punctuator/symbols。
+local function load_symbols(config)
+    local symbols = {}
+    local map = config:get_map("punctuator/symbols")
+    if not map then return symbols end
+    for _, key in ipairs(map:keys()) do
+        local name = key:match("^/([a-z]+)$")
+        if name and not name:match("^[ou]") then
+            local list = map:get(key):get_list()
+            local texts = {}
+            for i = 0, (list and list.size or 0) - 1 do
+                local value = list:get_value_at(i)
+                if value and value.value ~= "" then texts[#texts + 1] = value.value end
+            end
+            if #texts > 0 then symbols["o" .. name] = texts end
+        end
+    end
+    return symbols
+end
+
 local function init(env)
     env.path = rime_api.get_user_data_dir() .. "/" .. PHRASE_FILE
     env.phrases = {}
+    env.symbols = load_symbols(env.engine.schema.config)
     load_phrases(env)
 end
 
@@ -93,15 +119,20 @@ local function func(input, seg, env)
         for _, text in ipairs(date_texts(input, os.time())) do
             yield(Candidate("date", seg.start, seg._end, text, ""))
         end
+        for _, text in ipairs(env.symbols[input] or {}) do
+            yield(Candidate("date", seg.start, seg._end, text, ""))
+        end
         return
     end
     if not seg:has_tag("abc") then return end
     load_phrases(env)
-    for _, text in ipairs(env.phrases[input] or {}) do
-        local cand = Candidate("nova_phrase", seg.start, seg._end, text, "")
-        -- 排在拼音整句前面：候选先比覆盖的长度，再比 quality。
-        cand.quality = 1000
-        yield(cand)
+    for _, texts in ipairs({ env.phrases[input] or {}, env.symbols[input] or {} }) do
+        for _, text in ipairs(texts) do
+            local cand = Candidate("nova_phrase", seg.start, seg._end, text, "")
+            -- 排在拼音整句前面：候选先比覆盖的长度，再比 quality。
+            cand.quality = 1000
+            yield(cand)
+        end
     end
 end
 

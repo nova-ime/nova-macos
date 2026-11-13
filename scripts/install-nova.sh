@@ -44,7 +44,7 @@ if [ ! -d "$USERDIR" ] && [ -d "$HOME/Library/Rime" ]; then
     "$HOME/Library/Rime/" "$USERDIR/"
 fi
 mkdir -p "$USERDIR/lua"
-cp "$ROOT/nova-schema/nova.schema.yaml" "$ROOT/nova-schema/nova_lexicon.txt" "$USERDIR/"
+cp "$ROOT/nova-schema/nova.schema.yaml" "$ROOT/nova-schema/nova_lexicon.txt" "$ROOT/nova-schema/nova_quanpin.txt" "$ROOT/nova-schema/nova_rare.txt" "$USERDIR/"
 cp "$ROOT"/nova-schema/lua/*.lua "$USERDIR/lua/"
 # GPT-2 标橙插件的模型和字表（约 111 MB，不进 git）。默认在 nova-lm/model/，可用 NOVA_LM_DIR 指定。
 LM="${NOVA_LM_DIR:-$ROOT/nova-lm/model}"

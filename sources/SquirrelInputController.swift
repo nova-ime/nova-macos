@@ -155,6 +155,18 @@ final class SquirrelInputController: IMKInputController {
     }
   }
 
+  // nova_qp_raw / nova_qp_map 对得上当前输入时，返回拼音和编码位置到拼音位置的对照；否则原样返回编码。
+  func pinyinLetters(code: String) -> (String, [Int]) {
+    var raw = [CChar](repeating: 0, count: 4096)
+    var map = [CChar](repeating: 0, count: 16384)
+    guard rimeAPI.get_property(session, "nova_qp_raw", &raw, raw.count),
+          rimeAPI.get_property(session, "nova_qp_map", &map, map.count) else { return (code, []) }
+    let letters = String(cString: raw)
+    let positions = String(cString: map).split(separator: ",").compactMap { Int($0) }
+    guard !letters.isEmpty, positions.count == code.utf8.count + 1 else { return (code, []) }
+    return (letters, positions)
+  }
+
   // 原始字母光标，nova_cursor 属性为空时在末尾。
   func rawCursor(inputLength: Int) -> Int {
     var buffer = [CChar](repeating: 0, count: 32)
@@ -474,8 +486,10 @@ private extension SquirrelInputController {
       let hasTree = !browsing && rimeAPI.get_property(session, "nova_tree", &treeBuffer, treeBuffer.count) && ctx.menu.num_candidates > 0
       let tree = hasTree ? String(cString: treeBuffer) : ""
       // 有树时原始字母只画在面板里（带光标和按词块着色的下划线），输入框照常显示首选整句。
-      let letters = tree.isEmpty ? "" : rimeAPI.get_input(session).map { String(cString: $0) } ?? ""
-      let cursor = rawCursor(inputLength: letters.utf8.count)
+      let code = tree.isEmpty ? "" : rimeAPI.get_input(session).map { String(cString: $0) } ?? ""
+      let cursor = rawCursor(inputLength: code.utf8.count)
+      // 全拼时字母行显示拼音，见 lua/nova_quanpin.lua。
+      let (letters, letterMap) = code.isEmpty ? ("", []) : pinyinLetters(code: code)
 
       // update preedit text
       let preedit = ctx.composition.preedit.map({ String(cString: $0) }) ?? ""
@@ -564,7 +578,7 @@ private extension SquirrelInputController {
       // 空行表示还没有词块（只打了一个字母），这时什么都不显示。
       showPanel(preedit: inlinePreedit || !letters.isEmpty ? "" : preedit, selRange: selRange, tree: tree,
                 candidates: tree == "\n" ? [] : candidates, comments: comments, labels: labels, highlighted: Int(ctx.menu.highlighted_candidate_index),
-                letters: letters, cursor: cursor)
+                letters: letters, letterMap: letterMap, cursor: cursor)
       _ = rimeAPI.free_context(&ctx)
     } else {
       hidePalettes()
@@ -605,7 +619,7 @@ private extension SquirrelInputController {
 
   // swiftlint:disable:next function_parameter_count
   func showPanel(preedit: String, selRange: NSRange, tree: String, candidates: [String], comments: [String], labels: [String], highlighted: Int,
-                 letters: String = "", cursor: Int = 0) {
+                 letters: String = "", letterMap: [Int] = [], cursor: Int = 0) {
     guard let client = client, let panel = NSApp.squirrelAppDelegate.panel else { return }
     var inputPos = NSRect()
     client.attributes(forCharacterIndex: 0, lineHeightRectangle: &inputPos)
@@ -617,6 +631,7 @@ private extension SquirrelInputController {
     content.blocks = NovaBlock.parse(tree: tree)
     NovaUILog.record(letters: letters, first: candidates.first ?? preedit, blocks: content.blocks)
     content.letters = letters
+    content.letterMap = letterMap
     content.cursor = cursor
     content.highlighted = highlighted
     content.candidates = candidates.indices.map { index in

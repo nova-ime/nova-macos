@@ -14,6 +14,9 @@
 -- 让出的音节和那个相邻块一起单独解码，见 shrink。没有焦点时 [ ] 照常是标点。
 -- Shift+Delete 或 Control+Delete（Control+K 经 key_binder 变成前者）：把焦点块的词从用户词库里删掉，
 -- 没有焦点时删最后一块，见 delete_word。
+-- 用 [ ] 定过的边界上屏时记下来，下次同一串编码直接按它切，见 learn_bounds。
+
+local bounds = require("nova_bounds")
 
 local LEFT, RIGHT, SPACE = 0xff51, 0xff53, 0x20
 local HOME, END, BACKSPACE, DELETE = 0xff50, 0xff57, 0xff08, 0xffff
@@ -33,6 +36,8 @@ local function clear(ctx)
     ctx:set_property("nova_alt_page", "")
     ctx:set_property("nova_cycle", "")
     ctx:set_property("nova_redecode", "")
+    ctx:set_property("nova_resized", "")
+    ctx:set_property("nova_bounds_used", "")
 end
 
 -- 光标位置，以及是否有焦点（nova_cursor 不为空）。
@@ -52,41 +57,45 @@ local function set_cursor(ctx, cursor, focused)
     ctx:set_property("nova_alt_page", "")
 end
 
--- 输入在 at 处插入（delta=1）或删去 at 处的一个字母（delta=-1）后，固定段和上一次的树跟着平移：
--- 整段在改动前的不动，整段在改动后的移一位，和改动重叠的作废（它的按键变了）。
+-- 输入在 at 处删去 removed 个字母、插入 inserted 个字母后，固定段和上一次的树跟着平移：
+-- 整段在改动前的不动，整段在改动后的跟着移，和改动重叠的作废（它的按键变了）。
 -- 在段的末尾插入大写辅助码（aux）也算改这段：用户是要用辅助码重新筛选这个字。
-local function shift_range(from, to, at, delta, aux)
+local function shift_range(from, to, at, removed, inserted, aux)
     if to < at or (to == at and not aux) then return from, to end
-    local after = delta > 0 and at or at + 1
-    if from >= after then return from + delta, to + delta end
+    if from >= at + removed and (removed > 0 or from >= at) then
+        return from + inserted - removed, to + inserted - removed
+    end
     return nil
 end
 
-local function shift_properties(ctx, at, delta, aux)
+local function shift_properties(ctx, at, removed, inserted, aux)
+    local delta = inserted - removed
     local pins = {}
     for from, to, rest in (ctx:get_property("nova_pins") or ""):gmatch("(%d+):(%d+):([^\n]*)\n") do
-        local a, b = shift_range(tonumber(from), tonumber(to), at, delta, aux)
+        local a, b = shift_range(tonumber(from), tonumber(to), at, removed, inserted, aux)
         if a then pins[#pins + 1] = string.format("%d:%d:%s\n", a, b, rest) end
     end
     ctx:set_property("nova_pins", table.concat(pins))
     local open_end = tonumber(ctx:get_property("nova_pins_end") or "")
-    if open_end then ctx:set_property("nova_pins_end", tostring(open_end > at and open_end + delta or open_end)) end
+    if open_end then ctx:set_property("nova_pins_end", tostring(open_end > at and math.max(at, open_end + delta) or open_end)) end
     local lines = {}
     for line in (ctx:get_property("nova_tree") or ""):gmatch("[^\n]+") do
         local flags, from, to, rest = line:match("^([^\t]*)\t(%d+)\t(%d+)\t(.*)$")
         if flags then
-            local a, b = shift_range(tonumber(from), tonumber(to), at, delta, aux)
+            local a, b = shift_range(tonumber(from), tonumber(to), at, removed, inserted, aux)
             if a then lines[#lines + 1] = string.format("%s\t%d\t%d\t%s", flags, a, b, rest) end
         end
     end
     ctx:set_property("nova_tree", table.concat(lines, "\n"))
     ctx:set_property("nova_tree_input", "")
+    -- 中间的字母改了，伸缩时定的边界不再作数。
+    ctx:set_property("nova_resized", "")
 end
 
 -- 在光标处插入 text，或删去光标前（before=true）/后的一个字母。只处理光标不在末尾的情形。
 local function insert_at_cursor(ctx, text)
     local input, cursor = ctx.input, cursor_of(ctx)
-    shift_properties(ctx, cursor, 1, text:match("^[A-Z]$") ~= nil)
+    shift_properties(ctx, cursor, 0, 1, text:match("^[A-Z]$") ~= nil)
     ctx:set_property("nova_cursor", tostring(cursor + 1))
     ctx:set_property("nova_alt_page", "")
     ctx.input = input:sub(1, cursor) .. text .. input:sub(cursor + 1)
@@ -96,12 +105,21 @@ local function delete_at_cursor(ctx, before)
     local input, cursor = ctx.input, cursor_of(ctx)
     local at = before and cursor - 1 or cursor
     if at < 0 or at >= #input then return end
-    shift_properties(ctx, at, -1)
+    shift_properties(ctx, at, 1, 0)
     ctx:set_property("nova_cursor", tostring(at))
     ctx:set_property("nova_alt_page", "")
     if #input == 1 then ctx:clear() return end
     ctx.input = input:sub(1, at) .. input:sub(at + 2)
 end
+
+-- 全拼（nova_quanpin）用：输入在 at 处的 removed 个字母换成 text，固定段和树照上面平移。光标由调用方设。
+local function replace_input(ctx, at, removed, text, aux)
+    local input = ctx.input
+    shift_properties(ctx, at, removed, #text, aux)
+    ctx.input = input:sub(1, at) .. text .. input:sub(at + removed + 1)
+end
+
+local learn_bounds  -- 定义在 parse_tree 后面
 
 local function init(env)
     local ctx = env.engine.context
@@ -109,7 +127,11 @@ local function init(env)
     -- 只用来删用户词（delete_word）。和翻译器共用同一个用户词库；不设 memorize 回调，上屏时不会重复记词。
     local ok, memory = pcall(Memory, env.engine, env.engine.schema, "translator")
     env.memory = ok and memory or nil
-    env.commit = ctx.commit_notifier:connect(clear)
+    env.commit = ctx.commit_notifier:connect(function(c)
+        local ok, err = pcall(learn_bounds, c, c:get_commit_text())
+        if not ok then log.error("nova_tree_keys: " .. tostring(err)) end
+        clear(c)
+    end)
     env.update = ctx.update_notifier:connect(function(c)
         if not c:is_composing() then clear(c) end
     end)
@@ -143,6 +165,51 @@ local function parse_tree(tree)
     return blocks, focus
 end
 
+-- 上屏时学边界。nova_resized 是这次用 [ ] 定过的边界（`字节偏移:到边界后一个音节为止的输入` 每行一个），
+-- 边界还在的话把两侧的块记进 nova_bounds。nova_bounds_used 是 nova_sentences 这次对上的学过的条目：
+-- 边界还在就留着（用户在两侧选过字的话，字跟着换），被用户改掉了就忘掉，下次照解码器的切。
+-- 上屏的文字和树对不上时（直接选了整句候选）什么都不做。
+local function block_code(input, block)
+    local parts, pos = {}, block.from + 1
+    while pos <= block.to do
+        local token = input:match("^[a-z][a-z][A-Z]?[A-Z]?", pos)
+        if not token then return "" end
+        parts[#parts + 1] = token:sub(1, 2)
+        pos = pos + #token
+    end
+    return table.concat(parts)
+end
+
+function learn_bounds(ctx, text)
+    local resized, used = ctx:get_property("nova_resized") or "", ctx:get_property("nova_bounds_used") or ""
+    if resized == "" and used == "" then return end
+    local seg = ctx.composition:back()
+    if not seg then return end
+    local parts, ending, starting = {}, {}, {}
+    for _, block in ipairs((parse_tree(ctx:get_property("nova_tree") or ""))) do
+        parts[#parts + 1] = block.text
+        ending[block.to], starting[block.from] = block, block
+    end
+    local shown = table.concat(parts)
+    if shown == "" or text:sub(-#shown) ~= shown then return end
+    local input = ctx.input:sub(seg._start + 1, seg._end)
+    for pos, left, right in used:gmatch("(%d+):(%l+):(%l+)\n") do
+        local a, b = ending[tonumber(pos)], starting[tonumber(pos)]
+        if a and b and block_code(input, a) == left and block_code(input, b) == right then
+            -- 解码器自己也这么切时字可能不同（市｜长江、是｜长江），那不是用户改的，学过的字不动。
+            if a.chosen or b.chosen then bounds.put(left, a.text, right, b.text) end
+        else
+            bounds.drop(bounds.key_of(left, right))
+        end
+    end
+    for pos, prefix in resized:gmatch("(%d+):([^\n]*)\n") do
+        local a, b = ending[tonumber(pos)], starting[tonumber(pos)]
+        if a and b and input:sub(1, #prefix) == prefix then
+            bounds.put(block_code(input, a), a.text, block_code(input, b), b.text)
+        end
+    end
+end
+
 -- 走 ctx:select 才会记进用户词库；菜单里找不到（被 max_homophones 截掉）时直接上屏。
 local function commit_alternative(env, seg, text)
     local ctx = env.engine.context
@@ -153,6 +220,8 @@ local function commit_alternative(env, seg, text)
             return
         end
     end
+    -- 这条路不经过 commit_notifier，边界在这里学。
+    learn_bounds(ctx, text)
     env.engine:commit_text(text)
     ctx:clear()
 end
@@ -354,6 +423,14 @@ local function shrink(env, seg, blocks, focus, keep_front)
     ctx:set_property("nova_open_from", math.min(low, keep_from) .. ":" .. ctx.input)
     ctx:set_property("nova_redecode", low .. ":" .. high .. ":" .. ctx.input)
     ctx:set_property("nova_cycle", "")
+    -- 这条边界是用户定的，上屏时学，见 learn_bounds。连着按是在挪同一条边界，旧位置作废。
+    local moved, edge = keep_front and block.to or block.from, keep_front and keep_to or keep_from
+    local resized = {}
+    for line, pos in (ctx:get_property("nova_resized") or ""):gmatch("((%d+):[^\n]*\n)") do
+        if tonumber(pos) ~= moved and tonumber(pos) ~= edge then resized[#resized + 1] = line end
+    end
+    resized[#resized + 1] = edge .. ":" .. input:sub(1, edge + 2) .. "\n"
+    ctx:set_property("nova_resized", table.concat(resized))
     set_cursor(ctx, seg._start + keep_to, true)
     ctx:refresh_non_confirmed_composition()
 end
@@ -565,4 +642,4 @@ local function func(key, env)
     return 1
 end
 
-return { init = init, func = func, fini = fini }
+return { init = init, func = func, fini = fini, replace_input = replace_input }

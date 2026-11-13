@@ -179,6 +179,11 @@ struct Model {
   std::unordered_map<char32_t, int> vocab;  // single-character tokens
   int cls = 101, unk = 100;
   std::unordered_map<string, vector<std::pair<int, char32_t>>> allowed;  // code -> (token, char)
+  std::unordered_map<string, u32string> rare;  // code -> characters for which it is a rare reading, see score()
+  bool is_rare(const string &key, char32_t c) const {
+    auto it = rare.find(key.substr(0, 2));
+    return it != rare.end() && it->second.find(c) != u32string::npos;
+  }
   const void *owner = nullptr;  // filter whose tree is in the KV cache
 };
 
@@ -238,8 +243,15 @@ static string backend_dir() {
   return self.substr(0, self.rfind('/') + 1) + "nova-lm";
 }
 
-static std::shared_ptr<Model> load_model(const string &model_path, const string &charmap_path, int threads, int cap) {
+static std::shared_ptr<Model> load_model(const string &model_path, const string &charmap_path, const string &rare_path,
+                                         int threads, int cap) {
   auto m = std::make_shared<Model>();
+  std::ifstream rare_in(rare_path);
+  string line;
+  while (std::getline(rare_in, line)) {
+    auto tab = line.find('\t');
+    if (tab == 2) m->rare[line.substr(0, 2)] = decode(line.substr(tab + 1));
+  }
   if (!m->lm.load(model_path, threads, cap, backend_dir())) return nullptr;
   const auto &toks = m->lm.tokens();
   for (int i = 0; i < (int)toks.size(); i++) {
@@ -249,28 +261,28 @@ static std::shared_ptr<Model> load_model(const string &model_path, const string 
     else if (t.size() == 1) m->vocab.emplace(t[0], i);
   }
   std::ifstream in(charmap_path);
-  string line;
   while (std::getline(in, line)) {
     auto tab = line.find('\t');
     if (tab != 2) continue;
     auto &list = m->allowed[line.substr(0, 2)];
     for (char32_t c : decode(line.substr(tab + 1))) {
       auto it = m->vocab.find(c);
-      if (it != m->vocab.end()) list.emplace_back(it->second, c);
+      if (it != m->vocab.end() && !m->is_rare(line, c)) list.emplace_back(it->second, c);
     }
   }
   return m->allowed.empty() ? nullptr : m;
 }
 
 // Load in the background the first time; the filter passes everything through until it is ready.
-static std::shared_ptr<Model> model(const string &model_path, const string &charmap_path, int threads) {
+static std::shared_ptr<Model> model(const string &model_path, const string &charmap_path, const string &rare_path,
+                                    int threads) {
   std::lock_guard<std::mutex> lock(g_mutex);
   if (g_model || g_loading || model_path.empty() || charmap_path.empty() || g_loaded_from == model_path) return g_model;
   g_loading = true;
   g_loaded_from = model_path;  // one attempt per path, so a broken file is not reloaded on every key
   std::thread([=] {
     auto t0 = std::chrono::steady_clock::now();
-    auto m = load_model(model_path, charmap_path, threads, 2048);
+    auto m = load_model(model_path, charmap_path, rare_path, threads, 2048);
     double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     log_line(string(m ? "load ok " : "load FAILED ") + model_path + " " + std::to_string((int)ms) + "ms");
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -291,6 +303,7 @@ class NovaLmFilter : public rime::Filter {
       config->GetBool("nova_lm/debug", &debug_);
       config->GetString("nova_lm/model", &model_file_);
       config->GetString("nova_lm/charmap", &charmap_file_);
+      config->GetString("nova_lm/rare", &rare_file_);
       config->GetDouble("nova_lm/tau", &tau_);
       config->GetInt("nova_lm/sentences", &sentences_);
       config->GetInt("nova_lm/beam", &beam_);
@@ -314,7 +327,8 @@ class NovaLmFilter : public rime::Filter {
     if (!enabled_) return;
     model_file_ = resolve(model_file_);
     charmap_file_ = resolve(charmap_file_);
-    model(model_file_, charmap_file_, threads_);
+    rare_file_ = resolve(rare_file_);
+    model(model_file_, charmap_file_, rare_file_, threads_);
     commit_ = engine_->context()->commit_notifier().connect([this](rime::Context *ctx) {
       // Orange blocks committed unchanged stay out of the context: a wrong word there makes GPT-2
       // sure of the same wrong word the next time it is typed (两代 for 两袋).
@@ -501,13 +515,21 @@ class NovaLmFilter : public rime::Filter {
   // beat 嗯我知道了. Such a character counts as kUnseen at most, below any in-vocabulary homophone,
   // so it stays only where every candidate has one. `words` exempts the characters the decoder put
   // there inside a word of two or more (暴殄天物, 山莨菪碱): the dictionary vouches for those.
-  float score(Model &m, const u32string &s, const u32string *words = nullptr) {
+  //
+  // The same cap holds for a character typed with a rare reading of it (nova_rare.txt): GPT-2 sees
+  // only the characters, so 是从 (从 read zòng, 140 against 1294801 for cōng) read better to it than
+  // 失踪 for uizs and was re-picked. The decoder had 失踪 first; 万象 keeps such readings so they can
+  // be typed, and leaves the order to the word weights GPT-2 does not see. `keys` holds the code of
+  // each place; inside a word of the decoder's (放纵, 首都) the reading is not touched.
+  float score(Model &m, const u32string &s, const u32string *words = nullptr, const vector<string> *keys = nullptr) {
     float total = 0;
     for (size_t k = 0; k < s.size(); k++) {
       int tok = token(m, s[k]);
       float lp = m.lm.logp(node(m, s.substr(0, k)), tok);
-      bool unseen = tok == m.unk && is_han(s[k]) && !(words && k < words->size() && (*words)[k] == s[k]);
-      total += unseen ? std::min(lp, kUnseen) : lp;
+      bool in_word = words && k < words->size() && (*words)[k] == s[k];
+      bool unseen = tok == m.unk && is_han(s[k]) && !in_word;
+      bool rare = keys && k < keys->size() && !in_word && m.is_rare((*keys)[k], s[k]);
+      total += unseen || rare ? std::min(lp, kUnseen) : lp;
     }
     return total;
   }
@@ -707,7 +729,7 @@ class NovaLmFilter : public rime::Filter {
     u32string words(top.size(), U'\0');  // see score()
     for (const auto &blk : blocks)
       if (blk.b - blk.a > 1) words.replace(blk.a, blk.b - blk.a, top, blk.a, blk.b - blk.a);
-    for (const auto &s : sentences) scored.emplace(s, score(m, s, &words));
+    for (const auto &s : sentences) scored.emplace(s, score(m, s, &words, &keys));
     if (beams_.size() == top.size() + 1)
       for (const auto &b : beams_.back()) scored.emplace(b.text, b.score);
     float best = -INFINITY;
@@ -876,7 +898,7 @@ class NovaLmFilter : public rime::Filter {
   }
 
   bool enabled_ = false, debug_ = false;
-  string model_file_ = "nova_lm/gpt2.gguf", charmap_file_ = "nova_lm/charmap.tsv";
+  string model_file_ = "nova_lm/gpt2.gguf", charmap_file_ = "nova_lm/charmap.tsv", rare_file_ = "nova_rare.txt";
   double tau_ = 0.075;
   int sentences_ = 5, beam_ = 5, threads_ = 4, context_chars_ = 30;
   bool drop_orange_ = true;  // nova_lm/drop_orange_context

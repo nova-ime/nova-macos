@@ -19,12 +19,16 @@ switches:
     states: [半角, 全角]
   - name: ascii_punct
     states: [。，, ．，]
+  # 全拼：打的拼音切成音节后换成自然码双拼，其余照双拼工作，见 lua/nova_quanpin.lua。
+  - name: quanpin
+    states: [双拼, 全拼]
 
 engine:
   processors:
     - ascii_composer
     - recognizer
     - key_binder
+    - lua_processor@*nova_quanpin
     - lua_processor@*nova_tree_keys
     - speller
     - punctuator
@@ -40,7 +44,7 @@ engine:
   translators:
     - punct_translator
     - script_translator
-    # 日期时间（orq、osj、oxq）和自定义短语（用户目录下的 nova_phrases.txt）。
+    # 日期时间（orq、osj、oxq）、符号表（ofh、osx）和自定义短语（用户目录下的 nova_phrases.txt）。
     - lua_translator@*nova_phrases
   filters:
     - lua_filter@*nova_sentences
@@ -125,6 +129,8 @@ nova_lm:
   repick_tau: 0.2
   model: nova_lm/gpt2.gguf
   charmap: nova_lm/charmap.tsv
+  # 单字的冷僻读音（从 zòng、能 nài）：重选不换成它们，见 nova_lm.cc 的 score()。
+  rare: nova_rare.txt
   tau: 0.075
   sentences: 5
   beam: 5
