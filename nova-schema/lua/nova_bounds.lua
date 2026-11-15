@@ -44,17 +44,19 @@ local function rebuild()
 end
 
 local function parse(text)
-    local list, seen = {}, {}
+    local all, last = {}, {}
     for line in text:gmatch("[^\r\n]+") do
         local left, ltext, right, rtext = line:match("^([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)$")
         if left and valid(left, ltext, right, rtext) then
             local key = key_of(left, right)
-            -- 同一串编码只留最后一条。
-            if seen[key] then table.remove(list, seen[key]) end
-            list[#list + 1] = { left = left, ltext = ltext, right = right, rtext = rtext, key = key }
-            seen = {}
-            for i, entry in ipairs(list) do seen[entry.key] = i end
+            all[#all + 1] = { left = left, ltext = ltext, right = right, rtext = rtext, key = key }
+            last[key] = #all
         end
+    end
+    -- 同一串编码只留最后一条。
+    local list = {}
+    for i, entry in ipairs(all) do
+        if last[entry.key] == i then list[#list + 1] = entry end
     end
     return list
 end

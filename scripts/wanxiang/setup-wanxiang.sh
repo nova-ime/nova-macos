@@ -2,6 +2,7 @@
 # 下载万象词库和万象语法模型，转换成 Nova 的格式后放进 ~/Library/NovaSquirrel。
 #
 # - 词库：rime-wanxiang 的 zrm-fuzhu 版（自然码辅助码），用 wx2nova.py 转成 nova_wx.dict.yaml
+#   和简拼表 nova_wx_jp.dict.yaml（全拼的简拼用，主词典引入它）
 # - 模型：rime-wanxiang-data 的 wanxiang-lts-zh-hans.gram（约 420MB）
 # 来源：https://github.com/amzxyz/rime-wanxiang 、https://github.com/amzxyz/rime-wanxiang-data（CC-BY-4.0）
 #
@@ -29,6 +30,7 @@ unzip -q "$CACHE/$ZIP" -d "$CACHE/zrm"
 # shellcheck disable=SC2086
 python3 -I "$ROOT/scripts/wanxiang/wx2nova.py" "$CACHE/zrm/dicts" "$CACHE/nova_wx.dict.yaml" nova_wx $TABLES
 
-cp "$CACHE/nova_wx.dict.yaml" "$USERDIR/"
+mkdir -p "$USERDIR"
+cp "$CACHE/nova_wx.dict.yaml" "$CACHE/nova_wx_jp.dict.yaml" "$USERDIR/"
 cp "$CACHE/$GRAM" "$USERDIR/"
-echo "已放进 ${USERDIR}：nova_wx.dict.yaml、${GRAM}"
+echo "已放进 ${USERDIR}：nova_wx.dict.yaml、nova_wx_jp.dict.yaml、${GRAM}"

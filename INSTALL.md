@@ -148,13 +148,11 @@ You **don't** need to define `DEV_ID` if you don't intend to distribute the pack
 
 ### Directly Install
 
-**You might need to precede with sudo, and without a logout, the App might not work properly. Direct install is not very recommended.**
-
-Once built, you can install and try it live on your Mac computer:
+`make install` is disabled in this fork: it copied the build over `/Library/Input Methods/Squirrel.app`, which is the official Squirrel. Nova installs next to it as `NovaSquirrel.app`:
 
 ``` sh
-# Squirrel as a Universal app
-make install
+scripts/build-nova.sh     # Release build in build-release/
+scripts/install-nova.sh   # needs sudo; run it in a terminal
 ```
 
 ## Clean Up Artifacts

@@ -3,7 +3,7 @@
 #
 # 自然码双拼整句输入。辅助码只认大写：niRE 是「你」，nire 是「ni re」两个音节。
 # 词库和语法模型来自万象拼音（CC-BY-4.0，https://github.com/amzxyz/rime-wanxiang）：
-# zrm-fuzhu 词库由 scripts/wanxiang/setup-wanxiang.sh 转成 `音节;辅助码` 编码的 nova_wx。
+# zrm-fuzhu 词库由 scripts/wanxiang/setup-wanxiang.sh 转成 `音节;辅助码` 编码的 nova_wx，外加一张简拼表 nova_wx_jp。
 # 1898 句评测（.scratch/bench）里，整句正确率比墨奇词库＋八股文模型高约 15 个百分点。
 
 schema:
@@ -58,6 +58,21 @@ speller:
   initials: abcdefghijklmnopqrstuvwxyz
   delimiter: " '"
   algebra:
+    # 全拼的简拼：只打声母的音节写成「声母键 + V」两个字符（nh 是 nVhV），位宽和别的音节一样。
+    # 大写 V 不会和辅助码混：辅助码前面一定是两个小写字母。z/c/s 也能对到 zh/ch/sh（双拼里 zh/ch/sh 的声母键是 v/i/u）。
+    # 只有全拼开关（nova_quanpin.lua）会打出这种编码。
+    #
+    # 简拼只查简拼表（nova_wx_jp，音节写成 ni~，不带辅助码，由 wx2nova.py 生成），不查主词典：
+    # 主词典的音节带着辅助码，n 要展开成一千多个音节，连打几个简拼每键要上百毫秒；简拼表里只有二十来个。
+    # 第 5 条让没缩写的音节也能对上简拼表，这样一个词里可以混着打（zhonggr 中国人）。
+    # 这几条都用 abbrev：整串输入不含简拼时，librime 会丢掉所有 abbrev 得来的对应
+    # （Syllabifier::BuildSyllableGraph），所以双拼模式下简拼表等于不存在，候选和造句都不受影响。
+    - abbrev/^([a-z])[a-z]~$/$1V/
+    - abbrev/^v[a-z]~$/zV/
+    - abbrev/^i[a-z]~$/cV/
+    - abbrev/^u[a-z]~$/sV/
+    - abbrev/^([a-z][a-z])~$/$1/
+    - erase/^[a-z][a-z]~$/
     - derive/^(.+);(\w)(\w)$/$1\u$2/
     - derive/^(.+);(\w)(\w)$/$1\u$2\u$3/
     - derive/^(.+);(\w)(\w)$/$1/
@@ -129,8 +144,11 @@ nova_lm:
   repick_tau: 0.2
   model: nova_lm/gpt2.gguf
   charmap: nova_lm/charmap.tsv
-  # 单字的冷僻读音（从 zòng、能 nài）：重选不换成它们，见 nova_lm.cc 的 score()。
+  # 多音字每个读音的占比。占比不到文件首行 rare_share 的是冷僻读音（从 zòng、能 nài），重选不换成它们；
+  # 其余读音按 reading_weight × ln(占比) 加进 GPT-2 的句子分，见 nova_lm.cc 的 score()。
+  # 6486 句全集：reading_weight 0 → 0.5，整句全对 5042 → 5057（改好 31、改坏 16）。
   rare: nova_rare.txt
+  reading_weight: 0.5
   tau: 0.075
   sentences: 5
   beam: 5

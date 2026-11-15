@@ -46,6 +46,10 @@ fi
 mkdir -p "$USERDIR/lua"
 cp "$ROOT/nova-schema/nova.schema.yaml" "$ROOT/nova-schema/nova_lexicon.txt" "$ROOT/nova-schema/nova_quanpin.txt" "$ROOT/nova-schema/nova_rare.txt" "$USERDIR/"
 cp "$ROOT"/nova-schema/lua/*.lua "$USERDIR/lua/"
+# 全拼的简拼要查简拼表，旧的词库里没有。少了它别的功能照常，只是简拼不出字。
+if [ ! -f "$USERDIR/nova_wx_jp.dict.yaml" ]; then
+  echo "没找到简拼表（$USERDIR/nova_wx_jp.dict.yaml）：全拼的简拼不出字。运行 scripts/wanxiang/setup-wanxiang.sh 重新生成词库。"
+fi
 # GPT-2 标橙插件的模型和字表（约 111 MB，不进 git）。默认在 nova-lm/model/，可用 NOVA_LM_DIR 指定。
 LM="${NOVA_LM_DIR:-$ROOT/nova-lm/model}"
 if [ -f "$LM/gpt2.gguf" ] && [ -f "$LM/charmap.tsv" ]; then

@@ -148,8 +148,9 @@ final class SquirrelInputController: IMKInputController {
     }
   }
 
-  // 滚轮翻焦点块的备选，和 PageUp/PageDown 走同一条路，由 nova_tree_keys.lua 处理。
-  func turnAlternativePage(up: Bool) {
+  // 滚轮翻页和 PageUp/PageDown 走同一条路，由 nova_tree_keys.lua 处理：有焦点块时翻它的备选，
+  // 否则翻普通候选列表（第一次只打开列表，停在第一页）。
+  func turnPage(up: Bool) {
     if rimeAPI.process_key(session, Int32(up ? XK_Page_Up : XK_Page_Down), 0) {
       rimeUpdate()
     }
@@ -157,51 +158,17 @@ final class SquirrelInputController: IMKInputController {
 
   // nova_qp_raw / nova_qp_map 对得上当前输入时，返回拼音和编码位置到拼音位置的对照；否则原样返回编码。
   func pinyinLetters(code: String) -> (String, [Int]) {
-    var raw = [CChar](repeating: 0, count: 4096)
-    var map = [CChar](repeating: 0, count: 16384)
-    guard rimeAPI.get_property(session, "nova_qp_raw", &raw, raw.count),
-          rimeAPI.get_property(session, "nova_qp_map", &map, map.count) else { return (code, []) }
-    let letters = String(cString: raw)
-    let positions = String(cString: map).split(separator: ",").compactMap { Int($0) }
+    guard let letters = property("nova_qp_raw", capacity: 4096),
+          let map = property("nova_qp_map", capacity: 16384) else { return (code, []) }
+    let positions = map.split(separator: ",").compactMap { Int($0) }
     guard !letters.isEmpty, positions.count == code.utf8.count + 1 else { return (code, []) }
     return (letters, positions)
   }
 
   // 原始字母光标，nova_cursor 属性为空时在末尾。
   func rawCursor(inputLength: Int) -> Int {
-    var buffer = [CChar](repeating: 0, count: 32)
-    guard rimeAPI.get_property(session, "nova_cursor", &buffer, buffer.count),
-          let value = Int(String(cString: buffer)) else { return inputLength }
+    guard let value = property("nova_cursor", capacity: 32).flatMap({ Int($0) }) else { return inputLength }
     return min(max(value, 0), inputLength)
-  }
-
-  // swiftlint:disable:next identifier_name
-  func page(up: Bool) -> Bool {
-    var handled = false
-    handled = rimeAPI.change_page(session, up)
-    if handled {
-      rimeUpdate()
-    }
-    return handled
-  }
-
-  func moveCaret(forward: Bool) -> Bool {
-    let currentCaretPos = rimeAPI.get_caret_pos(session)
-    guard let input = rimeAPI.get_input(session) else { return false }
-    if forward {
-      if currentCaretPos <= 0 {
-        return false
-      }
-      rimeAPI.set_caret_pos(session, currentCaretPos - 1)
-    } else {
-      let inputStr = String(cString: input)
-      if currentCaretPos >= inputStr.utf8.count {
-        return false
-      }
-      rimeAPI.set_caret_pos(session, currentCaretPos + 1)
-    }
-    rimeUpdate()
-    return true
   }
 
   override func recognizedEvents(_ sender: Any!) -> Int {
@@ -444,6 +411,13 @@ private extension SquirrelInputController {
     return handled
   }
 
+  // 属性比缓冲区长时，librime 的 strncpy 不补结尾的 0。这时当作没有这个属性，不往缓冲区外面读。
+  func property(_ name: String, capacity: Int) -> String? {
+    var buffer = [CChar](repeating: 0, count: capacity)
+    guard rimeAPI.get_property(session, name, &buffer, capacity), buffer[capacity - 1] == 0 else { return nil }
+    return String(cString: buffer)
+  }
+
   func rimeConsumeCommittedText() {
     var commitText = RimeCommit.rimeStructInit()
     if rimeAPI.get_commit(session, &commitText) {
@@ -480,13 +454,15 @@ private extension SquirrelInputController {
     var ctx = RimeContext_stdbool.rimeStructInit()
     if rimeAPI.get_context(session, &ctx) {
       // 要在 get_context 之后读：nova_tree 由候选过滤器在生成菜单时写入。
-      var treeBuffer = [CChar](repeating: 0, count: 8192)
       // 翻页或移动高亮是在找树上没有的候选，这时才显示普通列表。
-      let browsing = ctx.menu.page_no > 0 || ctx.menu.highlighted_candidate_index > 0
-      let hasTree = !browsing && rimeAPI.get_property(session, "nova_tree", &treeBuffer, treeBuffer.count) && ctx.menu.num_candidates > 0
-      let tree = hasTree ? String(cString: treeBuffer) : ""
+      // 没有焦点时第一次翻页不交给 Rime（它会直接翻到第二页），nova_tree_keys 只把当时的输入写进 nova_list：
+      // 列表从第一页显示。
+      let input = rimeAPI.get_input(session).map { String(cString: $0) } ?? ""
+      let listOpen = !input.isEmpty && property("nova_list", capacity: 1024) == input
+      let browsing = ctx.menu.page_no > 0 || ctx.menu.highlighted_candidate_index > 0 || listOpen
+      let tree = browsing || ctx.menu.num_candidates == 0 ? "" : property("nova_tree", capacity: 8192) ?? ""
       // 有树时原始字母只画在面板里（带光标和按词块着色的下划线），输入框照常显示首选整句。
-      let code = tree.isEmpty ? "" : rimeAPI.get_input(session).map { String(cString: $0) } ?? ""
+      let code = tree.isEmpty ? "" : input
       let cursor = rawCursor(inputLength: code.utf8.count)
       // 全拼时字母行显示拼音，见 lua/nova_quanpin.lua。
       let (letters, letterMap) = code.isEmpty ? ("", []) : pinyinLetters(code: code)

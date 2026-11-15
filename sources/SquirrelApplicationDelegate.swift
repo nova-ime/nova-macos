@@ -11,7 +11,6 @@ import InputMethodKit
 
 final class SquirrelApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
   static let rimeWikiURL = URL(string: "https://github.com/rime/home/wiki")!
-  static let updateNotificationIdentifier = "SquirrelUpdateNotification"
   static let notificationIdentifier = "SquirrelNotification"
 
   let rimeAPI: RimeApi_stdbool = rime_get_api_stdbool().pointee
@@ -145,7 +144,8 @@ final class SquirrelApplicationDelegate: NSObject, NSApplicationDelegate, UNUser
   // prevent freezing the system
   func problematicLaunchDetected() -> Bool {
     var detected = false
-    let logFile = FileManager.default.temporaryDirectory.appendingPathComponent("squirrel_launch.json", conformingTo: .json)
+    // 文件名不和官方版共用：两个都没进沙盒，临时目录是同一个，2 秒内先后启动会被对方的记录误判成崩溃重启。
+    let logFile = FileManager.default.temporaryDirectory.appendingPathComponent("nova_squirrel_launch.json", conformingTo: .json)
     // print("[DEBUG] archive: \(logFile)")
     do {
       let archive = try Data(contentsOf: logFile, options: [.uncached])

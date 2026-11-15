@@ -1,7 +1,6 @@
-.PHONY: all install deps release debug
+.PHONY: all deps release debug
 
 all: release
-install: install-release
 
 RIME_BIN_DIR = librime/dist/bin
 RIME_LIB_DIR = librime/dist/lib
@@ -155,23 +154,14 @@ package: release $(PACKAGE)
 archive: package package/sign_update
 	bash package/make_archive
 
-DSTROOT = /Library/Input Methods
-SQUIRREL_APP_ROOT = $(DSTROOT)/Squirrel.app
+# Upstream's install targets copied the build over /Library/Input Methods/Squirrel.app, which is the
+# official Squirrel. Nova installs next to it as NovaSquirrel.app, with scripts/install-nova.sh.
+.PHONY: install install-debug install-release
 
-.PHONY: permission-check install-debug install-release
-
-permission-check:
-	[ -w "$(DSTROOT)" ] && [ -w "$(SQUIRREL_APP_ROOT)" ] || sudo chown -R ${USER} "$(DSTROOT)"
-
-install-debug: debug permission-check
-	rm -rf "$(SQUIRREL_APP_ROOT)"
-	cp -R $(DERIVED_DATA_PATH)/Build/Products/Debug/Squirrel.app "$(DSTROOT)"
-	DSTROOT="$(DSTROOT)" RIME_NO_PREBUILD=1 bash scripts/postinstall
-
-install-release: release permission-check
-	rm -rf "$(SQUIRREL_APP_ROOT)"
-	cp -R $(DERIVED_DATA_PATH)/Build/Products/Release/Squirrel.app "$(DSTROOT)"
-	DSTROOT="$(DSTROOT)" bash scripts/postinstall
+install install-debug install-release:
+	@echo "make $@ 已停用：它会覆盖 /Library/Input Methods 里的官方鼠须管。" >&2
+	@echo "请运行 scripts/build-nova.sh，再运行 scripts/install-nova.sh。" >&2
+	@exit 1
 
 .PHONY: clean clean-deps
 

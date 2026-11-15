@@ -64,8 +64,9 @@ local function parse_phrases(content)
     local phrases = {}
     for line in content:gmatch("[^\r\n]+") do
         if line:sub(1, 1) ~= "#" then
-            local text, code = line:match("^([^\t]+)\t([a-z]+)%s*")
-            if text then
+            -- 编码后面只能是行尾或下一列：不然 `ab1` 会被当成 `ab`。
+            local text, code, rest = line:match("^([^\t]+)\t([a-z]+)(.*)$")
+            if text and (rest == "" or rest:match("^%s")) then
                 local list = phrases[code]
                 if not list then list = {}; phrases[code] = list end
                 list[#list + 1] = text

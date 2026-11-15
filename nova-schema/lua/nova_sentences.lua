@@ -10,12 +10,32 @@ local WORDS_PER_SPAN = 6       -- 每段保留的词数
 local BEAM = 8                 -- 每个位置保留的路径数
 local EXTRA = 5                -- 补几条整句
 local CACHE_LIMIT = 2000
+-- 全拼简拼的音节写成「声母键 + 通配符」两个字符（nVhV），见 nova.schema.yaml 的 abbrev 规则和 nova_quanpin。
+-- 它占的位置和完整音节一样宽，后面不跟辅助码。
+local WILDCARD = "V"
+
+-- 这段编码里有没有辅助码。简拼音节里的通配符是大写字母，但不是辅助码。
+local function has_aux(code)
+    local pos = 1
+    while pos <= #code do
+        local token = code:match("^[a-z][a-z][A-Z]?[A-Z]?", pos) or code:match("^[a-z]" .. WILDCARD, pos)
+        if token then
+            if #token > 2 then return true end
+            pos = pos + #token
+        elseif code:find("^%u", pos) then
+            return true
+        else
+            pos = pos + 1
+        end
+    end
+    return false
+end
 
 -- 返回完整音节和结尾没打完的单个字母。没打完的字母不参与解码，词块也就不会每敲一键变一次。
 local function syllables(input)
     local tokens, pos = {}, 1
     while pos <= #input do
-        local token = input:match("^[a-z][a-z][A-Z]?[A-Z]?", pos)
+        local token = input:match("^[a-z][a-z][A-Z]?[A-Z]?", pos) or input:match("^[a-z]" .. WILDCARD, pos)
         if not token then
             local pending = input:match("^[a-z]$", pos)
             return pending and tokens or nil, pending or ""
@@ -186,9 +206,12 @@ end
 --   标记末尾的 a数字 是这块已经稳定了几个音节，见 frozen_lines。
 --   标记：首字符 1 表示用户选过，0 表示没有；含 f 是焦点块；含 c 是整句解码选了词频较低的词；
 --   含 o 是没有焦点时直接显示备选的不确定块，数字键从左到右连续编号；含 u 是解码器拿不准（面板标橙）；
---   含 s 是冻结的块（自动冻结，或选词时冻结的前文），nova_lm_filter 重选首选时不动它。
+--   含 s 是冻结的块（自动冻结，或选词时冻结的前文），nova_lm_filter 重选首选时不动它；
+--   含 x 是辅助码筛完还剩几个字、列成备选等用户选的块，见 choose_by_aux；
+--   含 t 是打错键后原样留下的字母块，见 tail_line。
+--   a数字 后面还可以跟 p页码/总页数（焦点块的备选分页时）和 h序号（↓/↑ 换词时当前用的是这一页第几个）。
 --   文字：`文字\31比例`；备选：`文字\31比例\31止[\31起]`，长度可以和块不同；带起点的是只换光标处
---   一个字的单字备选（起点在块中间）。
+--   一个字的单字备选（起点在块中间）。打错键的备选再带上改好的编码：`文字\31\31止\31起\31编码[\31种类\31整句]`。
 --   比例是在同段候选里占的词频比例，不是真实概率，可以为空。
 -- nova_pins 属性：每个固定段一行，`起:止:键:h|s:文字`。h 是用户选的；s 是选词时冻结的前文，
 --   这样改一处不会让前面的词重新解码；后面的词跟着新选的字重新解码。
@@ -203,7 +226,6 @@ local MAX_ALTS = 6
 local MAX_SAME_LENGTH_ALTS = 4 -- 给别的长度留位置，切分错了才改得了
 local OVERVIEW_ALTS = 2        -- 没有焦点时每个不确定块显示几个备选
 local MAX_LABELS = 9
-local CONFIDENT_SHARE = 80     -- 比例低于这个值算词频上没把握（冻结和备选用，不再决定颜色）
 -- 换几个上下文窗口（块前后各取几个音节）单独解码，至少这么多个窗口在这块的位置解出别的词，
 -- 就算解码器拿不准，面板标橙。评测里比按词频比例标准：标出的块少四成，真错的比例翻倍。
 local UNCERTAIN_WINDOWS = 2
@@ -343,8 +365,8 @@ local function parse_pins(env, tokens, offsets, input, extra)
     local pins = {}
     -- 选词时的最后一块在继续打字后要能和新字母组词，不再冻结。
     local open_end = tonumber(env.engine.context:get_property("nova_pins_end") or "")
-    for from, to, key, kind, text in value:gmatch("(%d+):(%d+):([^:]*):([hs]):([^\n]*)") do
-        from, to = tonumber(from), tonumber(to)
+    for from_s, to_s, key, kind, text in value:gmatch("(%d+):(%d+):([^:]*):([hs]):([^\n]*)") do
+        local from, to = tonumber(from_s), tonumber(to_s)
         local i, j = start_at[from], end_at[to]
         -- 用户选好的字不因后补的辅助码作废，前提是辅助码和它对得上（货号 + K）；
         -- 对不上（选了好又补 K）说明用户要换字，和自动冻结的段一样按辅助码重新筛选。
@@ -485,7 +507,6 @@ end
 -- 这样词不会越过用户定的边界。
 local function build_blocks(env, tokens, pins, default_text, spans, redecode)
     local blocks, n, i = {}, #tokens, 1
-    local has_pin = next(pins) ~= nil
     local before -- 紧挨在前面的固定段
     while i <= n do
         if pins[i] then
@@ -585,7 +606,7 @@ local function all_alternatives(env, tokens, offsets, block, cursor_syllable)
     local result = alternatives(env, tokens, offsets, block, cursor_syllable)
     local seen = { [block.text] = true }
     for _, alt in ipairs(result) do seen[alt.text .. ":" .. (alt.from or "")] = true end
-    local function more(first, last, from, list)
+    local function more(last, from, list)
         for _, text in ipairs(list) do
             if #result >= PAGE_LIMIT then return end
             local id = text .. ":" .. (from or "")
@@ -602,9 +623,9 @@ local function all_alternatives(env, tokens, offsets, block, cursor_syllable)
         for _, text in ipairs(span_words(env, tokens[cursor_syllable], 1, PAGE_LIMIT)) do
             if text ~= current then chars[#chars + 1] = text end
         end
-        more(cursor_syllable, cursor_syllable, offsets[cursor_syllable], chars)
+        more(cursor_syllable, offsets[cursor_syllable], chars)
     end
-    more(block.first, block.last, nil, span_words(env, table.concat(tokens, "", block.first, block.last), length, PAGE_LIMIT))
+    more(block.last, nil, span_words(env, table.concat(tokens, "", block.first, block.last), length, PAGE_LIMIT))
     return result
 end
 
@@ -757,11 +778,11 @@ local function serialize(env, blocks, tokens, offsets, focus, ages, cursor_sylla
             local all, current = cycling_list(env)
             if not all then
                 all = all_alternatives(env, tokens, offsets, block, cursor_syllable)
-                local lines = {}
+                local saved = {}
                 for _, alt in ipairs(all) do
-                    lines[#lines + 1] = string.format("%d:%d:%s\n", alt.from or from, alt.to, alt.text)
+                    saved[#saved + 1] = string.format("%d:%d:%s\n", alt.from or from, alt.to, alt.text)
                 end
-                env.engine.context:set_property("nova_focus_alts", table.concat(lines))
+                env.engine.context:set_property("nova_focus_alts", table.concat(saved))
             end
             local pages = math.max(1, math.ceil(#all / MAX_ALTS))
             local page = current and current > 0 and math.floor((current - 1) / MAX_ALTS) or math.min(page_of(env), pages - 1)
@@ -771,7 +792,6 @@ local function serialize(env, blocks, tokens, offsets, focus, ages, cursor_sylla
                 -- 都带上起点：换词后焦点块可能变了，数字键要按备选自己的范围固定。
                 alts[#alts + 1] = { text = alt.text, share = alt.share, to = alt.to, from = alt.from or from }
             end
-            fields[1] = flags
             if pages > 1 then fields[1] = fields[1] .. "p" .. (page + 1) .. "/" .. pages end
             if current and current > 0 then fields[1] = fields[1] .. "h" .. ((current - 1) % MAX_ALTS + 1) end
         end
@@ -866,7 +886,7 @@ local function choose_by_aux(env, blocks, tokens, offsets)
     local chosen, starts = {}, {}
     for _, block in ipairs(blocks) do
         local key = table.concat(tokens, "", block.first, block.last)
-        local words = not block.pinned and key:find("%u") and span_words(env, key, block.last - block.first + 1, MAX_LABELS + 1)
+        local words = not block.pinned and has_aux(key) and span_words(env, key, block.last - block.first + 1, MAX_LABELS + 1)
         -- 扩展区的生僻字（hk + N 除了好还有 𡚽、㚪）不算，不然几乎每个辅助码都要再选一次。
         if words then
             local common = {}
@@ -1122,7 +1142,7 @@ local function typo_fixes(env, code, broken, full)
         end
         if score and text and utf8.len(text) == #window then
             -- 从改动处前一个音节开始显示，看得出换掉了什么。
-            local first = math.max(1, math.floor(v[3] / 2) - lo / 2)
+            local first = math.max(1, v[3] // 2 - lo // 2)
             local last = math.min(#window, first + 4)
             local shown = text:sub(utf8.offset(text, first), (utf8.offset(text, last + 1) or #text + 1) - 1)
             scored[#scored + 1] = { code = v[1], kind = v[2], at = v[3], score = score - FIX_COST[v[2]], tokens = #window,
@@ -1189,7 +1209,8 @@ local function init(env)
     env.word_penalty = env.engine.schema.config:get_double("nova_sentences/word_penalty") or 0.0
     env.tree_enabled = env.engine.schema.config:get_bool("nova_tree/enabled") or false
     env.tree_debug = env.engine.schema.config:get_bool("nova_tree/debug") or false
-    env.lm_orange = env.engine.schema.config:get_bool("nova_lm/enabled") or false
+    env.lm_enabled = env.engine.schema.config:get_bool("nova_lm/enabled") or false
+    env.lm_orange = false
 end
 
 local function func(input, env)
@@ -1202,6 +1223,11 @@ local function func(input, env)
     end
     local stop = seg and seg._end - #(pending or "")
     local context = env.engine.context
+    -- 重新出候选就回到树，见 nova_tree_keys 的 list_open。
+    if (context:get_property("nova_list") or "") ~= "" then context:set_property("nova_list", "") end
+    -- nova_lm_filter 的模型加载好之后写 nova_lm_ready。配置里开着、但插件或模型没装（或还没加载完）时，
+    -- 标橙和改错键的排序仍由这里做，不然两边都不做。
+    env.lm_orange = env.lm_enabled and context:get_property("nova_lm_ready") == "1"
     -- nova_tree_keys 删了用户词之后写 nova_flush：缓存里还有那个词，清掉。
     if (context:get_property("nova_flush") or "") ~= "" then
         context:set_property("nova_flush", "")
@@ -1249,7 +1275,7 @@ local function func(input, env)
                 tree = "\n"
                 shown = Candidate("raw", seg._start, seg._end, pending, "")
             end
-            if typo and not typo.code:find("%u") then
+            if typo and not has_aux(typo.code) then
                 local full = context:get_property("nova_fix_full") == context.input
                 local key = (full and "F" or "Q") .. typo.code
                 local ok, fixes = true, env.fixes[key]

@@ -451,7 +451,7 @@ private extension NovaLayout {
       let comment: NSAttributedString
       let width: CGFloat
     }
-    let entries = content.candidates.enumerated().map { index, candidate -> Entry in
+    let entries = content.candidates.map { candidate -> Entry in
       let label = string(candidate.label, style.labelFont, NovaPalette.dim)
       let text = string(candidate.text, style.font, NovaPalette.primary)
       let comment = string(candidate.comment, style.labelFont, NovaPalette.dim)

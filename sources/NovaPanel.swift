@@ -221,12 +221,7 @@ private extension NovaPanel {
     }
     scrollDelta += event.scrollingDeltaY
     if abs(scrollDelta) >= (event.hasPreciseScrollingDeltas ? 30 : 1) {
-      // 有焦点块时翻它的备选，否则翻普通候选列表。
-      if shown?.blocks.contains(where: \.focused) == true {
-        inputController?.turnAlternativePage(up: scrollDelta > 0)
-      } else {
-        _ = inputController?.page(up: scrollDelta > 0)
-      }
+      inputController?.turnPage(up: scrollDelta > 0)
       scrollDelta = 0
     }
   }

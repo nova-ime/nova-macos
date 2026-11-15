@@ -7,9 +7,15 @@
 --
 -- 切音节：音节的二元词频（nova_quanpin.txt，scripts/wanxiang/quanpin_table.py 生成）上做 Viterbi，
 -- 末尾可以是没打完的音节（按以它开头的音节的总词频打分），切不成音节的字母每个罚 40（log 量纲）。
--- 每打一个字母只重切最后 3 个单元，前面的不再变。6486 句评测逐键切分，整句切对 98.9%。
---   单元：s 音节（双拼两个字母）、p 末尾没打完的音节（双拼的声母键）、g 切不成音节的字母（原样）、
---   a 大写辅助码（原样）、d 隔音符 '（不占双拼）、x 整段原样（日期 orq、符号表 ofh 这类编码）。
+-- 单独一个声母（b p m f d t n l g k h j q x r z c s y w，以及 zh ch sh）可以当简拼音节：nh 是你好，
+-- 罚 ABBREV（见下面的常量）。简拼写成「声母键 + 通配符 V」两个字符（nVhV），和别的音节一样宽，
+-- 下游的位置运算不用改；schema 的 abbrev 规则让词库认得这种编码。
+-- 末尾单独一个声母，前面是完整音节时仍当没打完的（nih 在去 nihao 的路上），不让词块每敲一键变一次；
+-- 前面是简拼时当简拼（nh 立刻解码），所以 nihaos 等到 nihaosj 才出 s、j。
+-- 每打一个字母只重切最后 3 个单元，前面的不再变。6486 句评测逐键切分，整句切对 98.9%（加简拼之前量的）。
+--   单元：s 音节（双拼两个字母）、j 简拼音节（声母键 + V）、p 末尾没打完的音节（双拼的声母键）、
+--   g 切不成音节的字母（原样）、a 大写辅助码（原样）、d 隔音符 '（不占双拼）、
+--   x 整段原样（日期 orq、符号表 ofh 这类编码）。
 -- 光标只停在单元之间：←/→ 按音节移动；在中间打字、退格、Delete 改的是光标处的拼音，
 -- 前后各一两个单元跟着重切，固定段和树照双拼的改动平移（nova_tree_keys.replace_input）。
 -- 输入被别处改了（选打错键的备选、空格上屏前半句）时，没变的头尾单元保留拼音，变了的部分从双拼反推。
@@ -19,10 +25,17 @@ local tree_keys = require("nova_tree_keys")
 
 local TABLE_FILE = "nova_quanpin.txt"
 local GARBAGE = -40.0
+-- 简拼音节的罚分，要介于正常音节（二元分数一般在 -3 到 -12）和 GARBAGE 之间。
+local ABBREV = -20.0
+-- 简拼音节编码里跟在声母键后面的通配符，和 nova.schema.yaml 的 abbrev 规则一致。
+local WILDCARD = "V"
 local WINDOW = 3
 local LEFT, RIGHT, BACKSPACE, DELETE, APOSTROPHE = 0xff51, 0xff53, 0xff08, 0xffff, 0x27
 -- 双拼的声母键反推拼音声母（没打完的音节从双拼反推时用）。
 local INITIAL_OF = { v = "zh", i = "ch", u = "sh" }
+-- 能单独当简拼的声母，对应的双拼声母键。
+local INITIAL_KEY = { zh = "v", ch = "i", sh = "u" }
+for letter in ("bpmfdtnlgkhjqxrzcsyw"):gmatch(".") do INITIAL_KEY[letter] = letter end
 
 local T  -- 表，所有会话共用，第一次用时读
 
@@ -74,8 +87,8 @@ local function bigram(a, b)
     return math.log(0.7 * c / T.uni[a] + 0.3 * math.exp(T.lu[b]))
 end
 
--- 一串小写字母切成单元。prev 是它前面的音节（没有时为 ""）。
-local function segment(text, prev)
+-- 一串小写字母切成单元。prev 是它前面的音节（没有时为 ""），after_abbr 是它前面的单元是不是简拼。
+local function segment(text, prev, after_abbr)
     local n = #text
     local best = {}
     for i = 0, n do best[i] = {} end
@@ -94,6 +107,14 @@ local function segment(text, prev)
             local v = score + GARBAGE
             local old = best[i + 1][""]
             if not old or v > old[1] then best[i + 1][""] = { v, i, last, text:sub(i + 1, i + 1), "g" } end
+            for l = 1, math.min(2, n - i) do
+                local s = text:sub(i + 1, i + l)
+                if INITIAL_KEY[s] then
+                    v = score + ABBREV
+                    old = best[i + l][""]
+                    if not old or v > old[1] then best[i + l][""] = { v, i, last, s, "j" } end
+                end
+            end
         end
     end
     local top, top_i, top_last, top_part = nil, n, nil, nil
@@ -122,28 +143,35 @@ local function segment(text, prev)
     while i > 0 do
         local entry = best[i][last]
         local raw, kind = entry[4], entry[5]
-        table.insert(out, 1, { raw = raw, code = kind == "s" and T.code[raw] or raw, kind = kind })
+        local code = raw
+        if kind == "s" then code = T.code[raw] elseif kind == "j" then code = INITIAL_KEY[raw] .. WILDCARD end
+        table.insert(out, 1, { raw = raw, code = code, kind = kind })
         i, last = entry[2], entry[3]
+    end
+    -- 末尾单独一个声母、前面是简拼：也当简拼。前面是完整音节时仍留着不动，见文件头。
+    local tail, before = out[#out], out[#out - 1]
+    if tail and tail.kind == "p" and INITIAL_KEY[tail.raw] and (before and before.kind == "j" or not before and after_abbr) then
+        tail.code, tail.kind = INITIAL_KEY[tail.raw] .. WILDCARD, "j"
     end
     return out
 end
 
--- 一段原始字母（可能夹着大写和 '）切成单元。prev 同上。
-local function tokenize(raw, prev)
+-- 一段原始字母（可能夹着大写和 '）切成单元。prev、after_abbr 同上。
+local function tokenize(raw, prev, after_abbr)
     local out, pos = {}, 1
     while pos <= #raw do
         local run = raw:match("^%l+", pos)
         if run then
-            for _, unit in ipairs(segment(run, prev)) do out[#out + 1] = unit end
+            for _, unit in ipairs(segment(run, prev, after_abbr)) do out[#out + 1] = unit end
             pos = pos + #run
         else
             local ch = raw:sub(pos, pos)
             out[#out + 1] = { raw = ch, code = ch == "'" and "" or ch, kind = ch == "'" and "d" or "a" }
             pos = pos + 1
         end
-        prev = ""
         local last = out[#out]
-        if last and last.kind == "s" then prev = last.raw end
+        prev = last and last.kind == "s" and last.raw or ""
+        after_abbr = last ~= nil and last.kind == "j"
     end
     return out
 end
@@ -160,8 +188,12 @@ local function from_code(code)
     while pos <= #code do
         local pair = code:match("^%l%l", pos)
         local syllable = pair and T.inv[pair]
+        local key = code:match("^%l" .. WILDCARD, pos)
         if syllable then
             out[#out + 1] = { raw = syllable, code = pair, kind = "s" }
+            pos = pos + 2
+        elseif key then
+            out[#out + 1] = { raw = INITIAL_OF[key:sub(1, 1)] or key:sub(1, 1), code = key, kind = "j" }
             pos = pos + 2
         else
             local ch = code:sub(pos, pos)
@@ -214,12 +246,11 @@ end
 
 local function publish(env, ctx)
     local units = env.units or {}
-    local map, c = { "0" }, 0
-    local r = 0
+    local map, r = { "0" }, 0
     for _, unit in ipairs(units) do
         -- 音节中间的双拼位置对到音节开头，这样点拼音里任何一个字母都落到音节末尾（见 NovaLayout）。
         for k = 1, #unit.code do map[#map + 1] = tostring(k == #unit.code and r + #unit.raw or r) end
-        r, c = r + #unit.raw, c + #unit.code
+        r = r + #unit.raw
     end
     ctx:set_property("nova_qp_raw", concat(units, "raw"))
     ctx:set_property("nova_qp_map", table.concat(map, ","))
@@ -281,13 +312,14 @@ local function edit(env, ctx, at, removed, text, at_end)
     local window = concat(units, "raw", lo, hi)
     window = window:sub(1, at - start) .. text .. window:sub(at - start + removed + 1)
     local prev = ""
+    local after_abbr = lo > 1 and units[lo - 1].kind == "j"
     for i = lo - 1, 1, -1 do
         if units[i].kind == "s" then prev = units[i].raw break end
         if units[i].kind ~= "d" then break end
     end
     local new = {}
     for i = 1, lo - 1 do new[#new + 1] = units[i] end
-    for _, unit in ipairs(tokenize(window, prev)) do new[#new + 1] = unit end
+    for _, unit in ipairs(tokenize(window, prev, after_abbr)) do new[#new + 1] = unit end
     for i = hi + 1, #units do new[#new + 1] = units[i] end
     local cursor
     if not at_end then

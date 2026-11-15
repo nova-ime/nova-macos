@@ -18,27 +18,42 @@ FW="$APP/Contents/Frameworks"
 PLUG=lib/rime-plugins/librime-nova-lm.dylib
 if [ -f "$PLUG" ]; then
   BREW="$(brew --prefix)"
+  # ggml 的库名带主版本号（libggml.0、libggml.1），以插件实际链接的为准。
+  # Homebrew 升级 ggml 之后旧名字的库就不在了，这时要先重编插件。
+  GGML=()
+  while IFS= read -r lib; do GGML+=("$lib"); done \
+    < <(otool -L "$PLUG" | awk '$1 ~ /\/libggml[^\/]*\.dylib$/ {print $1}')
+  [ "${#GGML[@]}" -gt 0 ] || { echo "GPT-2 插件没有链接 ggml：$PLUG"; exit 1; }
+  for lib in "${GGML[@]}"; do
+    [ -f "$lib" ] || { echo "插件链接的 $lib 不在了（Homebrew 升级过 ggml？）。先运行 nova-lm/build.sh 重编插件。"; exit 1; }
+  done
   mkdir -p "$FW/rime-plugins/nova-lm"
+  # 上次构建留下的 ggml 可能是另一个主版本，先清掉。
+  rm -f "$FW"/libggml*.dylib
   cp "$PLUG" "$FW/rime-plugins/"
   cp lib/rime-plugins/nova-lm/*.so "$FW/rime-plugins/nova-lm/"
-  cp "$BREW/opt/ggml/lib/libggml.0.dylib" "$BREW/opt/ggml/lib/libggml-base.0.dylib" \
-     "$BREW/opt/libomp/lib/libomp.dylib" "$FW/"
+  cp "${GGML[@]}" "$BREW/opt/libomp/lib/libomp.dylib" "$FW/"
   chmod u+w "$FW"/libggml*.dylib "$FW/libomp.dylib" "$FW/rime-plugins/librime-nova-lm.dylib" \
     "$FW"/rime-plugins/nova-lm/*.so
-  for lib in libggml.0 libggml-base.0 libomp; do
-    install_name_tool -id "@rpath/$lib.dylib" "$FW/$lib.dylib" 2>/dev/null
+  CHANGES=(-change "$BREW/opt/libomp/lib/libomp.dylib" @rpath/libomp.dylib)
+  install_name_tool -id @rpath/libomp.dylib "$FW/libomp.dylib" 2>/dev/null
+  for lib in "${GGML[@]}"; do
+    name="$(basename "$lib")"
+    install_name_tool -id "@rpath/$name" "$FW/$name" 2>/dev/null
+    install_name_tool -add_rpath @loader_path "$FW/$name" 2>/dev/null
+    CHANGES+=(-change "$lib" "@rpath/$name")
   done
   for f in "$FW"/libggml*.dylib "$FW/rime-plugins/librime-nova-lm.dylib" "$FW"/rime-plugins/nova-lm/*.so; do
-    install_name_tool \
-      -change "$BREW/opt/ggml/lib/libggml.0.dylib" @rpath/libggml.0.dylib \
-      -change "$BREW/opt/ggml/lib/libggml-base.0.dylib" @rpath/libggml-base.0.dylib \
-      -change "$BREW/opt/libomp/lib/libomp.dylib" @rpath/libomp.dylib "$f" 2>/dev/null
+    install_name_tool "${CHANGES[@]}" "$f" 2>/dev/null
   done
   install_name_tool -add_rpath @loader_path/.. "$FW/rime-plugins/librime-nova-lm.dylib" 2>/dev/null
   for f in "$FW"/rime-plugins/nova-lm/*.so; do
     install_name_tool -add_rpath @loader_path/../.. "$f" 2>/dev/null
+    # 后端是 nova-lm/build.sh 从 Homebrew 复制来的，要和插件出自同一版 ggml。
+    for dep in $(otool -L "$f" | awk '$1 ~ /^@rpath\/libggml/ {print $1}'); do
+      [ -f "$FW/${dep#@rpath/}" ] || { echo "$(basename "$f") 要的 ${dep#@rpath/} 不在 app 里。先运行 nova-lm/build.sh 重编插件。"; exit 1; }
+    done
   done
-  install_name_tool -add_rpath @loader_path "$FW/libggml.0.dylib" 2>/dev/null
   for f in "$FW"/libggml*.dylib "$FW/libomp.dylib" "$FW/rime-plugins/librime-nova-lm.dylib" \
            "$FW"/rime-plugins/nova-lm/*.so; do
     codesign --force --sign - "$f"

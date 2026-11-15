@@ -21,7 +21,8 @@
 // With `repick` on, a block GPT-2 would write differently (its share is below `repick_tau` and
 // another text has a larger share) takes that text: the first candidate and the tree change, and
 // the decoder's text becomes the alternative. Blocks nova_sentences froze (s flag) and blocks the
-// user chose stay as they are. Off unless nova_lm/repick is set; nova.schema.yaml turns it on.
+// user chose stay as they are, and so do blocks with an abbreviated syllable (full-pinyin `nh`, see
+// kWildcard); they are still marked orange and keep GPT-2's alternative. Off unless nova_lm/repick is set; nova.schema.yaml turns it on.
 // Typed key by key over the same 26 domains
 // (repick_tau 0.2): whole sentences right 57.4% -> 77.3%, 1387 sentences fixed and 96 broken of
 // 6486; the last two characters change half as often while typing; p99 per key 11.5 -> 11.7 ms.
@@ -56,12 +57,14 @@
 // Per-key time unchanged (541 sentences, mean 5.1 ms, p99 11.3 ms either way).
 //
 // Schema options (all under nova_lm/): enabled, model (GGUF, relative to the user or shared data
-// directory), charmap (`code \t chars` per line), tau, sentences, beam, threads, context, drop_orange_context,
-// repick, repick_tau, debug.
+// directory), charmap (`code \t chars` per line), rare (`rare_share \t x` first, then
+// `code \t character \t share` per reading, see score()), reading_weight, tau, sentences, beam,
+// threads, context, drop_orange_context, repick, repick_tau, debug.
 // With debug on, property nova_lm holds the time this filter took and every block's share, and
 // a test can set property nova_lm_history to replace the committed text ("-" for none); the
-// environment then overrides repick: NOVA_REPICK=<repick_tau> turns it on, NOVA_REPICK_FROZEN=1
-// lets it change frozen blocks too.
+// environment then overrides the schema: NOVA_REPICK=<repick_tau> turns repick on,
+// NOVA_REPICK_FROZEN=1 lets it change frozen blocks too, NOVA_READING=<reading_weight>, and
+// NOVA_DE_MARGIN=<toward 地/得>[,<toward 的>] (negative leaves 的/地/得 alone).
 // Creating nova_lm/debug.on in the user data directory turns on nova_lm/debug.log (see log_line).
 
 #include <rime/candidate.h>
@@ -81,6 +84,7 @@
 #include <dlfcn.h>
 #include <sys/stat.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -159,12 +163,28 @@ static vector<string> split(const string &s, char sep) {
   return out;
 }
 
+// Wildcard of an abbreviated syllable in full-pinyin mode (nova_quanpin.lua): the initial's key and
+// this letter, `nVhV` for 你好 typed nh. It is two characters like a full syllable and takes no aux
+// letters. No character, rare reading or 的/地/得 key is spelled so: `allowed` has no such code and
+// is_rare, reading_lp and the `de` check find nothing. A block with such a syllable is never re-picked
+// (Block::abbr): repick_tau was set on candidates that share one code, where GPT-2's probability
+// concentrates; for an abbreviation the candidates are different words, the mass is spread, conf is
+// almost always under tau, and GPT-2 would override the dictionary's and the user's first choice.
+static constexpr char kWildcard = 'V';
+
 // Syllables of a block key, as nova_sentences.lua cuts them: two lowercase letters, then up to two
-// uppercase aux letters. Returns the 2-letter codes, or nothing if the key does not parse.
+// uppercase aux letters, or a lowercase letter and the wildcard. Returns the 2-letter codes, or
+// nothing if the key does not parse.
 static vector<string> codes_of(const string &key) {
   vector<string> out;
   for (size_t i = 0; i < key.size();) {
-    if (i + 1 >= key.size() || !islower(key[i]) || !islower(key[i + 1])) return {};
+    if (i + 1 >= key.size() || !islower(key[i])) return {};
+    if (key[i + 1] == kWildcard) {
+      out.push_back(key.substr(i, 2));
+      i += 2;
+      continue;
+    }
+    if (!islower(key[i + 1])) return {};
     out.push_back(key.substr(i, 2));
     i += 2;
     for (int k = 0; k < 2 && i < key.size() && isupper(key[i]); k++) i++;
@@ -183,6 +203,14 @@ struct Model {
   bool is_rare(const string &key, char32_t c) const {
     auto it = rare.find(key.substr(0, 2));
     return it != rare.end() && it->second.find(c) != u32string::npos;
+  }
+  // code + character -> ln of the reading's share of the character, for characters with several
+  // readings (nova_rare.txt); absent means one reading, 0.
+  std::unordered_map<string, float> reading;
+  float reading_lp(const string &key, char32_t c) const {
+    if (reading.empty()) return 0.f;
+    auto it = reading.find(key.substr(0, 2) + encode(u32string(1, c)));
+    return it == reading.end() ? 0.f : it->second;
   }
   const void *owner = nullptr;  // filter whose tree is in the KV cache
 };
@@ -248,9 +276,21 @@ static std::shared_ptr<Model> load_model(const string &model_path, const string 
   auto m = std::make_shared<Model>();
   std::ifstream rare_in(rare_path);
   string line;
+  // First `rare_share \t x`: a reading with a share under x is rare; without that line none is.
+  // Then `code \t character \t share` per reading. scripts/wanxiang/rare_readings.py writes both.
+  double rare_share = 0;
   while (std::getline(rare_in, line)) {
-    auto tab = line.find('\t');
-    if (tab == 2) m->rare[line.substr(0, 2)] = decode(line.substr(tab + 1));
+    if (line.empty() || line[0] == '#') continue;
+    vector<string> f = split(line, '\t');
+    if (f.size() == 2 && f[0] == "rare_share") {
+      rare_share = atof(f[1].c_str());
+      continue;
+    }
+    if (f.size() < 3 || f[0].size() != 2) continue;
+    double share = atof(f[2].c_str());
+    if (share <= 0) continue;
+    m->reading[f[0] + f[1]] = (float)std::log(share);
+    if (share < rare_share) m->rare[f[0]] += decode(f[1]);
   }
   if (!m->lm.load(model_path, threads, cap, backend_dir())) return nullptr;
   const auto &toks = m->lm.tokens();
@@ -312,6 +352,7 @@ class NovaLmFilter : public rime::Filter {
       config->GetBool("nova_lm/drop_orange_context", &drop_orange_);
       config->GetBool("nova_lm/repick", &repick_);
       config->GetDouble("nova_lm/repick_tau", &repick_tau_);
+      config->GetDouble("nova_lm/reading_weight", &reading_w_);
     }
     if (debug_) {
       if (const char *e = getenv("NOVA_REPICK")) {
@@ -319,6 +360,7 @@ class NovaLmFilter : public rime::Filter {
         repick_tau_ = atof(e);
       }
       repick_frozen_ = getenv("NOVA_REPICK_FROZEN") != nullptr;
+      if (const char *e = getenv("NOVA_READING")) reading_w_ = atof(e);
       if (const char *e = getenv("NOVA_DE_MARGIN")) {  // `to 地/得[,to 的]`; negative: leave 的/地/得 alone
         de_margin_ = (float)atof(e);
         if (const char *comma = strchr(e, ',')) de_margin_plain_ = (float)atof(comma + 1);
@@ -329,7 +371,8 @@ class NovaLmFilter : public rime::Filter {
     charmap_file_ = resolve(charmap_file_);
     rare_file_ = resolve(rare_file_);
     model(model_file_, charmap_file_, rare_file_, threads_);
-    commit_ = engine_->context()->commit_notifier().connect([this](rime::Context *ctx) {
+    if (ready()) announce(engine_->context());
+    commit_ =engine_->context()->commit_notifier().connect([this](rime::Context *ctx) {
       // Orange blocks committed unchanged stay out of the context: a wrong word there makes GPT-2
       // sure of the same wrong word the next time it is typed (两代 for 两袋).
       u32string text = decode(ctx->GetCommitText());
@@ -378,6 +421,7 @@ class NovaLmFilter : public rime::Filter {
       if (ctx && log_on()) log_line("key\t" + ctx->input() + "\tmodel not ready");
       return translation;
     }
+    announce(ctx);
     auto t0 = std::chrono::steady_clock::now();
     if (debug_) {  // tests set the left context directly
       string forced = ctx->get_property("nova_lm_history");
@@ -459,6 +503,7 @@ class NovaLmFilter : public rime::Filter {
     bool chosen, focus, aux;  // aux: nova_sentences lists what the typed aux code leaves (x flag)
     bool frozen, swapped = false;  // frozen: s flag; swapped: re-picked on this key
     bool de = false;  // a 的/地/得 of the block is not the decoder's, see the header
+    bool abbr = false;  // has an abbreviated syllable (second character kWildcard): not re-picked
     float conf = 1.f;
     u32string alt;
   };
@@ -466,6 +511,14 @@ class NovaLmFilter : public rime::Filter {
   std::shared_ptr<Model> ready() {
     std::lock_guard<std::mutex> lock(g_mutex);
     return g_model;
+  }
+
+  // nova_sentences leaves the orange marks and the order of typo fixes to this filter only once
+  // property nova_lm_ready is "1"; with the plugin or the model missing it keeps doing both.
+  void announce(rime::Context *ctx) {
+    if (announced_ || !ctx) return;
+    announced_ = true;
+    ctx->set_property("nova_lm_ready", "1");
   }
 
   int token(const Model &m, char32_t c) const {
@@ -521,6 +574,10 @@ class NovaLmFilter : public rime::Filter {
   // 失踪 for uizs and was re-picked. The decoder had 失踪 first; 万象 keeps such readings so they can
   // be typed, and leaves the order to the word weights GPT-2 does not see. `keys` holds the code of
   // each place; inside a word of the decoder's (放纵, 首都) the reading is not touched.
+  //
+  // Outside such a word every typed character also gets reading_weight * ln P(code | character),
+  // the share of that reading among the character's single-character weights: the decoder's side
+  // of the score, which GPT-2 alone does not see. Characters with one reading get 0.
   float score(Model &m, const u32string &s, const u32string *words = nullptr, const vector<string> *keys = nullptr) {
     float total = 0;
     for (size_t k = 0; k < s.size(); k++) {
@@ -528,8 +585,10 @@ class NovaLmFilter : public rime::Filter {
       float lp = m.lm.logp(node(m, s.substr(0, k)), tok);
       bool in_word = words && k < words->size() && (*words)[k] == s[k];
       bool unseen = tok == m.unk && is_han(s[k]) && !in_word;
-      bool rare = keys && k < keys->size() && !in_word && m.is_rare((*keys)[k], s[k]);
+      bool typed = keys && k < keys->size() && !in_word && (*keys)[k].size() == 2;  // not chosen by the user
+      bool rare = typed && m.is_rare((*keys)[k], s[k]);
       total += unseen || rare ? std::min(lp, kUnseen) : lp;
+      if (typed) total += reading_w_ * m.reading_lp((*keys)[k], s[k]);
     }
     return total;
   }
@@ -566,7 +625,8 @@ class NovaLmFilter : public rime::Filter {
       if (!add()) return;
     }
     m.lm.flush();
-    FILE *dump = getenv("NOVA_FIX_DUMP") ? fopen(getenv("NOVA_FIX_DUMP"), "a") : nullptr;
+    const char *dump_path = getenv("NOVA_FIX_DUMP");
+    FILE *dump = dump_path ? fopen(dump_path, "a") : nullptr;
     for (size_t i = 0; i < fixes.size(); i++) {
       float lp = score(m, sentences[i]);
       if (dump) {
@@ -627,6 +687,7 @@ class NovaLmFilter : public rime::Filter {
         int parent = node(m, b.text);
         for (const auto &[tok, c] : *options) {
           float s = b.score + m.lm.logp(parent, tok);
+          if (!fixed[step].second) s += reading_w_ * m.reading_lp(keys[step], c);
           if ((int)next.size() == beam_ && s <= next.back().score) continue;
           u32string text = b.text;
           text.push_back(c);
@@ -668,6 +729,7 @@ class NovaLmFilter : public rime::Filter {
       vector<string> codes = codes_of(blk.fields[3]);
       u32string text = decode(split(blk.fields[4], '\x1f')[0]);
       if (codes.empty() || codes.size() != text.size()) return false;
+      for (const auto &c : codes) blk.abbr = blk.abbr || c[1] == kWildcard;
       blk.a = top.size();
       blk.b = blk.a + text.size();
       for (size_t k = 0; k < codes.size(); k++) {
@@ -798,7 +860,7 @@ class NovaLmFilter : public rime::Filter {
         for (size_t k = 0; k < cur.size(); k++)
           if (blk.alt[k] != cur[k] && norm(u32string(1, blk.alt[k])) == norm(u32string(1, cur[k])))
             blk.alt[k] = cur[k];
-      if (repick_ && !blk.aux && !blk.focus && (!blk.frozen || repick_frozen_) && blk.alt.size() == cur.size() &&
+      if (repick_ && !blk.aux && !blk.abbr && !blk.focus && (!blk.frozen || repick_frozen_) && blk.alt.size() == cur.size() &&
           blk.conf < repick_tau_ && alt_mass > blk.conf) {
         top.replace(blk.a, cur.size(), blk.alt);
         retext(blk, blk.alt);
@@ -904,6 +966,8 @@ class NovaLmFilter : public rime::Filter {
   bool drop_orange_ = true;  // nova_lm/drop_orange_context
   bool repick_ = false, repick_frozen_ = false;
   double repick_tau_ = 0.2;
+  double reading_w_ = 0;  // weight of ln P(code | character), see score()
+  bool announced_ = false;  // nova_lm_ready is set, see announce()
   int swaps_ = 0;  // blocks re-picked on the last key
   // Blocks of the last key (`from:to:text`) and how many syllables each has kept its text.
   std::unordered_map<string, int> last_ages_;

@@ -5,6 +5,8 @@
 -- Rime 自己的光标始终在末尾，所以候选总是覆盖整句。光标前一个字母所在的词块是焦点，数字键只选它；
 -- 有焦点时 -/=、,/.（PageUp/PageDown）翻这个词的备选；↓/↑ 把这个词直接换成下一个/上一个备选，
 -- 一直按 ↑ 回到原来的词，见 cycle。
+-- 没有焦点时第一次按 =（PageDown）只打开普通候选列表、停在第一页，之后的翻页归 Rime；
+-- 在第一页按 -（PageUp）回到树，见 list_open。
 -- nova_cursor 为空表示没有焦点（光标在末尾，数字键直接选不确定块的备选，从左到右连续编号）；
 -- 等于输入长度表示光标也在末尾，但焦点在最后一块（Tab 跳到最后一块的末尾）。
 -- 选词时只冻结前面的块，所选范围和它后面的部分重新解码，后面的字可以跟新选的字组词
@@ -17,6 +19,9 @@
 -- 用 [ ] 定过的边界上屏时记下来，下次同一串编码直接按它切，见 learn_bounds。
 
 local bounds = require("nova_bounds")
+
+-- 全拼简拼的音节是「声母键 + 通配符」两个字符（nVhV），见 nova.schema.yaml 的 abbrev 规则和 nova_quanpin。
+local WILDCARD = "V"
 
 local LEFT, RIGHT, SPACE = 0xff51, 0xff53, 0x20
 local HOME, END, BACKSPACE, DELETE = 0xff50, 0xff57, 0xff08, 0xffff
@@ -38,6 +43,17 @@ local function clear(ctx)
     ctx:set_property("nova_redecode", "")
     ctx:set_property("nova_resized", "")
     ctx:set_property("nova_bounds_used", "")
+    -- 不清的话，下次打出同一串错的编码，没按空格就去算多打、漏打的改法，第一次空格也直接上屏。
+    ctx:set_property("nova_fix_full", "")
+    ctx:set_property("nova_list", "")
+end
+
+-- 没有焦点时翻页是在找树上没有的候选，面板改显示普通列表。第一次按 PageDown 交给 Rime 的话，
+-- 它直接翻到第二页，第一页的候选就看不到了；所以第一次只写 nova_list，面板从第一页显示列表。
+-- nova_list 记的是打开时的输入，面板和这里都拿它和当前输入比；nova_sentences 重新出候选时清掉它
+-- （改了字母、选了一段、移了光标），所以输入没变而候选变了的时候不会留着。
+local function list_open(ctx)
+    return ctx.input ~= "" and ctx:get_property("nova_list") == ctx.input
 end
 
 -- 光标位置，以及是否有焦点（nova_cursor 不为空）。
@@ -128,8 +144,8 @@ local function init(env)
     local ok, memory = pcall(Memory, env.engine, env.engine.schema, "translator")
     env.memory = ok and memory or nil
     env.commit = ctx.commit_notifier:connect(function(c)
-        local ok, err = pcall(learn_bounds, c, c:get_commit_text())
-        if not ok then log.error("nova_tree_keys: " .. tostring(err)) end
+        local learned, err = pcall(learn_bounds, c, c:get_commit_text())
+        if not learned then log.error("nova_tree_keys: " .. tostring(err)) end
         clear(c)
     end)
     env.update = ctx.update_notifier:connect(function(c)
@@ -172,8 +188,9 @@ end
 local function block_code(input, block)
     local parts, pos = {}, block.from + 1
     while pos <= block.to do
-        local token = input:match("^[a-z][a-z][A-Z]?[A-Z]?", pos)
-        if not token then return "" end
+        local token = input:match("^[a-z][a-z][A-Z]?[A-Z]?", pos) or input:match("^[a-z]" .. WILDCARD, pos)
+        -- 简拼的音节不是确定的读音，不学。
+        if not token or token:sub(2, 2) == WILDCARD then return "" end
         parts[#parts + 1] = token:sub(1, 2)
         pos = pos + #token
     end
@@ -246,7 +263,7 @@ end
 local function syllable_ranges(input)
     local ranges, pos = {}, 1
     while pos <= #input do
-        local token = input:match("^[a-z][a-z][A-Z]?[A-Z]?", pos)
+        local token = input:match("^[a-z][a-z][A-Z]?[A-Z]?", pos) or input:match("^[a-z]" .. WILDCARD, pos)
         if not token then break end
         ranges[#ranges + 1] = { pos - 1, pos - 1 + #token }
         pos = pos + #token
@@ -271,7 +288,7 @@ local function block_chars(input, block, from, to)
     return a and b and block.text:sub(a, b - 1) or nil
 end
 
-local function choose(env, seg, blocks, focus, chosen, alt)
+local function choose(env, seg, blocks, chosen, alt)
     local ctx = env.engine.context
     -- 打错键的备选带着改好的编码：换掉这一段输入，整段重新解码。
     if alt.code then
@@ -308,7 +325,6 @@ local function choose(env, seg, blocks, focus, chosen, alt)
     ctx:refresh_non_confirmed_composition()
 end
 
--- Shift+←/→：跳到上一个/下一个词块的开头；往右越过最后一块就回到末尾。
 -- Shift+←/→：跳到上一个/下一个词块的末尾。没有焦点时往左到最后一块、往右到第一块；
 -- 最后一块再往右回到没有焦点，所以一直按 Tab 是循环：第一块 … 最后一块、没有焦点、第一块。
 local function jump_block(ctx, blocks, step)
@@ -523,7 +539,7 @@ end
 local function pending_letter(input)
     local pos = 1
     while pos <= #input do
-        local token = input:match("^[a-z][a-z][A-Z]?[A-Z]?", pos)
+        local token = input:match("^[a-z][a-z][A-Z]?[A-Z]?", pos) or input:match("^[a-z]" .. WILDCARD, pos)
         if not token then return input:match("^[a-z]$", pos) end
         pos = pos + #token
     end
@@ -545,6 +561,19 @@ local function commit_before_pending(env, seg)
     return true
 end
 
+-- 空格：有打错键的原样字母块时，首选只到打错的音节前。交给 Rime 的话它只确认这一段、不上屏，
+-- 剩下的字母另成一段（o 开头的还会被符号表接走），要再按一次空格。这里一次上屏：前面的字 + 原样的字母。
+local function commit_with_raw_tail(env, seg)
+    local ctx = env.engine.context
+    local top = seg.menu:get_candidate_at(0)
+    if not top or top._end >= seg._end then return false end
+    local tail, text = ctx.input:sub(top._end + 1), top.text
+    ctx:pop_input(#tail)
+    commit_alternative(env, ctx.composition:back(), text)
+    env.engine:commit_text(tail)
+    return true
+end
+
 local function is_code_letter(code)
     return (code >= 0x61 and code <= 0x7a) or (code >= 0x41 and code <= 0x5a)
 end
@@ -558,7 +587,7 @@ local function func(key, env)
     if code == DELETE and (key:ctrl() or key:shift()) then
         local tree = ctx:get_property("nova_tree") or ""
         local seg = ctx.composition:back()
-        if tree == "" or seg.selected_index > 0 or seg.menu:prepare(1) == 0 then return 2 end
+        if tree == "" or seg.selected_index > 0 or seg.menu:prepare(1) == 0 or list_open(ctx) then return 2 end
         local blocks, focus = parse_tree(tree)
         delete_word(env, seg, blocks, focus)
         return 1
@@ -589,6 +618,16 @@ local function func(key, env)
         turn_page(ctx, (code == PAGE_UP or code == COMMA) and -1 or 1)
         return 1
     end
+    if code == PAGE_UP or code == PAGE_DOWN then
+        -- 树正显示着（有树、有候选、还在第一页第一项）才接：PageDown 打开列表，列表第一页上 PageUp 关掉。
+        if (ctx:get_property("nova_tree") or "") == "" then return 2 end
+        local seg = ctx.composition:back()
+        if seg.selected_index > 0 or seg.menu:prepare(1) == 0 then return 2 end
+        local open = list_open(ctx)
+        if (code == PAGE_DOWN) == open then return 2 end
+        ctx:set_property("nova_list", open and "" or ctx.input)
+        return 1
+    end
     local is_digit = (code >= 0x31 and code <= 0x39) or code == SEMICOLON
     local is_cycle = focused and (code == UP or code == DOWN)
     local is_shrink = focused and (code == BRACKET_LEFT or code == BRACKET_RIGHT)
@@ -600,9 +639,11 @@ local function func(key, env)
     if seg.selected_index > 0 then return 2 end
     -- 菜单空时过滤器没有运行，属性里还是上一次的树。
     if seg.menu:prepare(1) == 0 then return 2 end
+    -- 列表刚打开、还停在第一项时也一样；空格除外，高亮的就是首选整句，照常由这里上屏。
+    if code ~= SPACE and list_open(ctx) then return 2 end
     if code == SPACE then
         -- 有打错键的原样字母块（标记 t）：第一次空格不上屏，先把多打、漏打的改法也算出来列成备选；
-        -- 再按一次空格原样上屏。
+        -- 再按一次空格原样上屏，见 commit_with_raw_tail。
         local has_typo = false
         for line in tree:gmatch("[^\n]+") do
             local flags = line:match("^[^\t]*")
@@ -617,6 +658,7 @@ local function func(key, env)
         end
         -- 空格上屏整句：光标回到末尾，首选本来就覆盖整句。
         if focused then set_cursor(ctx, #ctx.input, false) end
+        if has_typo and commit_with_raw_tail(env, seg) then return 1 end
         return commit_before_pending(env, seg) and 1 or 2
     end
     local blocks, focus = parse_tree(tree)
@@ -633,7 +675,7 @@ local function func(key, env)
         -- ; 没有可选的备选时照常是标点。
         if not alt and code == SEMICOLON then return 2 end
         -- 没有这个编号时吞掉，否则选中的是面板上看不到的候选。
-        if alt then choose(env, seg, blocks, focus, chosen, alt) end
+        if alt then choose(env, seg, blocks, chosen, alt) end
         return 1
     end
     -- 还没有词块时也吞掉。

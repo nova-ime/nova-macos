@@ -48,7 +48,7 @@ identifier_name:
   min_length: # only min_length
     warning: 3
     error: 2
-  excluded: [i, URL, of, by] # excluded via string array
+  excluded: [i, x, y, URL, of, by, to, up] # excluded via string array
 large_tuple:
   warning: 3
   error: 5

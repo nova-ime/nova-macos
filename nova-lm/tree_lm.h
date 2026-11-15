@@ -139,8 +139,6 @@ class TreeLM {
 
   const std::vector<std::string> &tokens() const { return tokens_; }
   int size() const { return (int)nodes_.size(); }
-  int capacity() const { return cap_; }
-  int pos(int node) const { return nodes_[node].pos; }
   int max_pos() const { return npos_; }
 
   // Drop every node from `keep` on (their KV cells are reused).
@@ -168,8 +166,6 @@ class TreeLM {
     vDSP_dotpr(row_.data(), 1, p.h.data(), 1, &s, D_);
     return s - p.lse;
   }
-
-  bool flushed(int node) const { return node < done_; }
 
   // Run all nodes added since the last flush.
   void flush() {

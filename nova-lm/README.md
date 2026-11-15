@@ -19,6 +19,10 @@ librime 滤镜 `nova_lm_filter`，接在 `lua_filter@*nova_sentences` 后面。�
 3. `scripts/install-nova.sh`：把 `nova-lm/model/` 里的模型和字表复制到用户目录的 `nova_lm/`。
    没有模型时照常安装，插件原样放行。
 
+Homebrew 升级 ggml 的主版本后（库名从 `libggml.0` 变成 `libggml.1`），插件链接的旧库就不在了，要重跑第 1 步；
+第 2 步发现这种情况会停下并提示。ggml 0.27 换成 1.0.0 后 GPT-2 的打分略有变化：1622 句评测（eval0）整句全对
+1094 → 1091，最终输出有 21 句不同。
+
 ## 模型文件（不进 git）
 
 `nova-lm/model/` 里两个文件，约 111 MB：

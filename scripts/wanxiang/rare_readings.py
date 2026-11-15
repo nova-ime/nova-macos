@@ -9,7 +9,12 @@ built on such a reading reads well to it and was re-picked over the word the use
 是从 instead of 失踪. A reading is rare when its single-character weight is under SHARE of the
 character's total; inside a word of two or more characters (放纵, 首都) it is not affected.
 
-Output: one line per code, `code \t characters`.
+Every reading of a character with more than one also carries its share, so GPT-2 can weigh how likely
+the typed code is for that character (log P(code | char), the decoder's side of the sentence score
+that GPT-2 does not see). Characters with one reading have share 1 and are left out.
+
+Output: `rare_share \t SHARE` first, the threshold the plugin reads; then one line per reading,
+`code \t character \t share`, sorted by code.
 """
 import collections
 import sys
@@ -36,19 +41,22 @@ def main(dict_path, out_path):
                 continue
             code = parts[1].split(";")[0]
             weights[parts[0]][code] += weight
-    rare = collections.defaultdict(list)
+    rows, rare = [], 0
     for char, codes in weights.items():
         total = sum(codes.values())
         if len(codes) < 2 or total <= 0:
             continue
         for code, weight in codes.items():
-            if weight < total * SHARE:
-                rare[code].append(char)
+            share = max(weight, 1) / total
+            rows.append((code, char, share))
+            rare += share < SHARE
+    rows.sort()
     with open(out_path, "w", encoding="utf-8") as out:
-        out.write("# 单字的冷僻读音（占该字单字词频不到 0.5%），由 scripts/wanxiang/rare_readings.py 生成。\n")
-        for code in sorted(rare):
-            out.write(code + "\t" + "".join(sorted(rare[code])) + "\n")
-    print(f"{sum(map(len, rare.values()))} rare readings in {len(rare)} codes -> {out_path}")
+        out.write(f"rare_share\t{SHARE:g}\n")
+        out.write("# 多音字每个读音占该字单字词频的比例；不到 rare_share 的算冷僻读音。由 scripts/wanxiang/rare_readings.py 生成。\n")
+        for code, char, share in rows:
+            out.write(f"{code}\t{char}\t{share:.3g}\n")
+    print(f"{len(rows)} readings, {rare} rare -> {out_path}")
 
 
 if __name__ == "__main__":
