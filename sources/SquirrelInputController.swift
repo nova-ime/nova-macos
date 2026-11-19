@@ -13,6 +13,8 @@ final class SquirrelInputController: IMKInputController {
 
   private weak var client: IMKTextInput?
   private let rimeAPI: RimeApi_stdbool = rime_get_api_stdbool().pointee
+  // nova-ui 的便捷层（nova_ui_rime.h）按 void* 收 RimeApi*。
+  private let rimeHandle = UnsafeMutableRawPointer(rime_get_api_stdbool())
   private var preedit: String = ""
   private var selRange: NSRange = .empty
   private var caretPos: Int = 0
@@ -126,7 +128,7 @@ final class SquirrelInputController: IMKInputController {
   }
 
   func selectCandidate(_ index: Int) -> Bool {
-    let success = rimeAPI.select_candidate_on_current_page(session, index)
+    let success = nova_ui_rime_select_candidate(rimeHandle, session, Int32(index)) != 0
     if success {
       rimeUpdate()
     }
@@ -135,15 +137,14 @@ final class SquirrelInputController: IMKInputController {
 
   // 数字键由 nova_tree_keys.lua 处理，点击备选走同一条路。
   func pinAlternative(_ label: Int) {
-    if rimeAPI.process_key(session, Int32(0x30 + label), 0) {
+    if nova_ui_rime_pin_alternative(rimeHandle, session, Int32(label)) != 0 {
       rimeUpdate()
     }
   }
 
   // 点击字母或词块：改原始字母光标，再发 F20 让 nova_tree_keys.lua 按新光标重画树。
   func moveCursor(to position: Int) {
-    rimeAPI.set_property(session, "nova_cursor", "\(position)")
-    if rimeAPI.process_key(session, Int32(XK_F20), 0) {
+    if nova_ui_rime_move_cursor(rimeHandle, session, Int32(position)) != 0 {
       rimeUpdate()
     }
   }
@@ -151,24 +152,9 @@ final class SquirrelInputController: IMKInputController {
   // 滚轮翻页和 PageUp/PageDown 走同一条路，由 nova_tree_keys.lua 处理：有焦点块时翻它的备选，
   // 否则翻普通候选列表（第一次只打开列表，停在第一页）。
   func turnPage(up: Bool) {
-    if rimeAPI.process_key(session, Int32(up ? XK_Page_Up : XK_Page_Down), 0) {
+    if nova_ui_rime_turn_page(rimeHandle, session, up ? 1 : 0) != 0 {
       rimeUpdate()
     }
-  }
-
-  // nova_qp_raw / nova_qp_map 对得上当前输入时，返回拼音和编码位置到拼音位置的对照；否则原样返回编码。
-  func pinyinLetters(code: String) -> (String, [Int]) {
-    guard let letters = property("nova_qp_raw", capacity: 4096),
-          let map = property("nova_qp_map", capacity: 16384) else { return (code, []) }
-    let positions = map.split(separator: ",").compactMap { Int($0) }
-    guard !letters.isEmpty, positions.count == code.utf8.count + 1 else { return (code, []) }
-    return (letters, positions)
-  }
-
-  // 原始字母光标，nova_cursor 属性为空时在末尾。
-  func rawCursor(inputLength: Int) -> Int {
-    guard let value = property("nova_cursor", capacity: 32).flatMap({ Int($0) }) else { return inputLength }
-    return min(max(value, 0), inputLength)
   }
 
   override func recognizedEvents(_ sender: Any!) -> Int {
@@ -411,13 +397,6 @@ private extension SquirrelInputController {
     return handled
   }
 
-  // 属性比缓冲区长时，librime 的 strncpy 不补结尾的 0。这时当作没有这个属性，不往缓冲区外面读。
-  func property(_ name: String, capacity: Int) -> String? {
-    var buffer = [CChar](repeating: 0, count: capacity)
-    guard rimeAPI.get_property(session, name, &buffer, capacity), buffer[capacity - 1] == 0 else { return nil }
-    return String(cString: buffer)
-  }
-
   func rimeConsumeCommittedText() {
     var commitText = RimeCommit.rimeStructInit()
     if rimeAPI.get_commit(session, &commitText) {
@@ -453,20 +432,6 @@ private extension SquirrelInputController {
 
     var ctx = RimeContext_stdbool.rimeStructInit()
     if rimeAPI.get_context(session, &ctx) {
-      // 要在 get_context 之后读：nova_tree 由候选过滤器在生成菜单时写入。
-      // 翻页或移动高亮是在找树上没有的候选，这时才显示普通列表。
-      // 没有焦点时第一次翻页不交给 Rime（它会直接翻到第二页），nova_tree_keys 只把当时的输入写进 nova_list：
-      // 列表从第一页显示。
-      let input = rimeAPI.get_input(session).map { String(cString: $0) } ?? ""
-      let listOpen = !input.isEmpty && property("nova_list", capacity: 1024) == input
-      let browsing = ctx.menu.page_no > 0 || ctx.menu.highlighted_candidate_index > 0 || listOpen
-      let tree = browsing || ctx.menu.num_candidates == 0 ? "" : property("nova_tree", capacity: 8192) ?? ""
-      // 有树时原始字母只画在面板里（带光标和按词块着色的下划线），输入框照常显示首选整句。
-      let code = tree.isEmpty ? "" : input
-      let cursor = rawCursor(inputLength: code.utf8.count)
-      // 全拼时字母行显示拼音，见 lua/nova_quanpin.lua。
-      let (letters, letterMap) = code.isEmpty ? ("", []) : pinyinLetters(code: code)
-
       // update preedit text
       let preedit = ctx.composition.preedit.map({ String(cString: $0) }) ?? ""
 
@@ -551,10 +516,8 @@ private extension SquirrelInputController {
       }
       // swiftlint:enable identifier_name
       let selRange = NSRange(location: start.utf16Offset(in: preedit), length: preedit.utf16.distance(from: start, to: end))
-      // 空行表示还没有词块（只打了一个字母），这时什么都不显示。
-      showPanel(preedit: inlinePreedit || !letters.isEmpty ? "" : preedit, selRange: selRange, tree: tree,
-                candidates: tree == "\n" ? [] : candidates, comments: comments, labels: labels, highlighted: Int(ctx.menu.highlighted_candidate_index),
-                letters: letters, letterMap: letterMap, cursor: cursor)
+      showPanel(preedit: preedit, selRange: selRange, candidates: candidates, comments: comments, labels: labels,
+                pageNo: Int(ctx.menu.page_no), highlighted: Int(ctx.menu.highlighted_candidate_index), numCandidates: numCandidates)
       _ = rimeAPI.free_context(&ctx)
     } else {
       hidePalettes()
@@ -593,27 +556,54 @@ private extension SquirrelInputController {
     client.setMarkedText(attrString, selectionRange: NSRange(location: caretPos, length: 0), replacementRange: .empty)
   }
 
+  // 显示树还是普通列表、字母行显示什么，由 nova-ui 决定（nova_ui_assemble）：
+  // 要在 get_context 之后读，nova_tree 由候选过滤器在生成菜单时写入。
   // swiftlint:disable:next function_parameter_count
-  func showPanel(preedit: String, selRange: NSRange, tree: String, candidates: [String], comments: [String], labels: [String], highlighted: Int,
-                 letters: String = "", letterMap: [Int] = [], cursor: Int = 0) {
+  func showPanel(preedit: String, selRange: NSRange, candidates: [String], comments: [String], labels: [String],
+                 pageNo: Int, highlighted: Int, numCandidates: Int) {
     guard let client = client, let panel = NSApp.squirrelAppDelegate.panel else { return }
     var inputPos = NSRect()
     client.attributes(forCharacterIndex: 0, lineHeightRectangle: &inputPos)
     panel.position = inputPos
     panel.inputController = self
-    var content = NovaContent()
-    content.preedit = preedit
-    content.selRange = selRange
-    content.blocks = NovaBlock.parse(tree: tree)
-    NovaUILog.record(letters: letters, first: candidates.first ?? preedit, blocks: content.blocks)
-    content.letters = letters
-    content.letterMap = letterMap
-    content.cursor = cursor
-    content.highlighted = highlighted
-    content.candidates = candidates.indices.map { index in
-      let label = index < labels.count ? labels[index] : "\(index + 1)"
-      return NovaCandidate(label: label, text: candidates[index].precomposedStringWithCanonicalMapping, comment: comments[index].precomposedStringWithCanonicalMapping)
+    // C 字符串由这里持有，函数结束时一起释放。
+    var owned = [UnsafeMutablePointer<CChar>]()
+    defer { owned.forEach { free($0) } }
+    func cStrings(_ strings: [String]) -> [UnsafePointer<CChar>?] {
+      strings.map { string in
+        let pointer = strdup(string)!
+        owned.append(pointer)
+        return UnsafePointer(pointer)
+      }
     }
+    let preeditC = cStrings([preedit])
+    let textsC = cStrings(candidates.map { $0.precomposedStringWithCanonicalMapping })
+    let commentsC = cStrings(comments.map { $0.precomposedStringWithCanonicalMapping })
+    let labelsC = cStrings(labels)
+    var input = NovaUIAssembleInput()
+    input.page_no = Int32(pageNo)
+    input.highlighted = Int32(highlighted)
+    input.num_candidates = Int32(numCandidates)
+    input.preedit = preeditC[0]
+    input.sel_location = selRange.location == NSNotFound ? -1 : Int32(selRange.location)
+    input.sel_length = Int32(selRange.length)
+    input.inline_preedit = inlinePreedit ? 1 : 0
+    input.count = Int32(candidates.count)
+    input.label_count = Int32(labels.count)
+    let handle = textsC.withUnsafeBufferPointer { texts in
+      commentsC.withUnsafeBufferPointer { comments in
+        labelsC.withUnsafeBufferPointer { labels in
+          input.texts = texts.baseAddress
+          input.comments = comments.baseAddress
+          input.labels = labels.baseAddress
+          return nova_ui_rime_assemble(rimeHandle, session, &input)
+        }
+      }
+    }
+    guard let handle, let view = nova_ui_content_view(handle)?.pointee else { return }
+    defer { nova_ui_content_free(handle) }
+    let content = NovaContent(view)
+    NovaUILog.record(letters: content.letters, first: content.candidates.isEmpty ? content.preedit : candidates[0], blocks: content.blocks)
     panel.update(content)
   }
 }

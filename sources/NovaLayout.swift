@@ -3,6 +3,8 @@
 //  Nova Squirrel
 //
 //  候选面板的数据和几何。这里只算要画什么、画在哪，不碰窗口。
+//  平台无关的部分（nova_tree 解析、内容组装、排版）在 nova-ui/（C++，C API 见 nova_ui.h），
+//  这个文件只是 macOS 的薄封装：提供测宽回调，把颜色语义映射成 NovaPalette，把显示列表转成 NovaView 能画的结构。
 //
 
 import AppKit
@@ -12,10 +14,14 @@ struct NovaChoice: Equatable {
   // 在同一段候选里占的词频比例（0-100），不是真实概率。词库里没有时为空。
   let share: Int?
 
-  init(field: String) {
-    let parts = field.split(separator: "\u{1F}", omittingEmptySubsequences: false).map(String.init)
-    text = parts.first ?? ""
-    share = parts.count > 1 ? Int(parts[1]) : nil
+  init(text: String, share: Int?) {
+    self.text = text
+    self.share = share
+  }
+
+  init(_ choice: NovaUIChoice) {
+    text = choice.text.map { String(cString: $0) } ?? ""
+    share = choice.has_share != 0 ? Int(choice.share) : nil
   }
 }
 
@@ -39,19 +45,28 @@ struct NovaBlock: Equatable {
   // 原样的标记字段，只给界面日志用。
   let flags: String
 
-  // nova_tree 属性：每块一行，格式见 nova_sentences.lua。
+  init(_ block: NovaUIBlock) {
+    from = Int(block.from)
+    to = Int(block.to)
+    pinned = block.pinned != 0
+    focused = block.focused != 0
+    corrected = block.corrected != 0
+    uncertain = block.uncertain != 0
+    overview = block.overview != 0
+    word = NovaChoice(block.word)
+    alternatives = (0..<Int(block.alt_count)).map { NovaChoice(block.alts[$0]) }
+    page = block.page.map { String(cString: $0) } ?? ""
+    current = block.has_current != 0 ? Int(block.current) : nil
+    flags = block.flags.map { String(cString: $0) } ?? ""
+  }
+
+  // nova_tree 属性：每块一行，格式见 nova_sentences.lua。解析在 nova-ui。
   static func parse(tree: String) -> [NovaBlock] {
-    tree.split(separator: "\n").map { line in
-      let fields = line.split(separator: "\t").map(String.init)
-      let flags = fields.first ?? ""
-      return NovaBlock(from: fields.count > 1 ? Int(fields[1]) ?? 0 : 0, to: fields.count > 2 ? Int(fields[2]) ?? 0 : 0,
-                       pinned: flags.hasPrefix("1"), focused: flags.contains("f"), corrected: flags.contains("c"), uncertain: flags.contains("u"), overview: flags.contains("o"),
-                       word: NovaChoice(field: fields.count > 4 ? fields[4] : ""),
-                       alternatives: fields.dropFirst(5).map(NovaChoice.init(field:)),
-                       page: flags.range(of: #"p\d+/\d+"#, options: .regularExpression).map { String(flags[$0].dropFirst()) } ?? "",
-                       current: flags.range(of: #"h\d+"#, options: .regularExpression).flatMap { Int(flags[$0].dropFirst()) },
-                       flags: flags)
-    }
+    guard let parsed = nova_ui_tree_parse(tree) else { return [] }
+    defer { nova_ui_tree_free(parsed) }
+    var count: Int32 = 0
+    guard let blocks = nova_ui_tree_blocks(parsed, &count) else { return [] }
+    return (0..<Int(count)).map { NovaBlock(blocks[$0]) }
   }
 
   // 绿：用户选过。紫：语法推翻了词频（多半是对的）。橙：解码器拿不准。见 nova_sentences.lua 的 measure_block。
@@ -93,19 +108,27 @@ struct NovaContent {
   // 全拼时 letters 是拼音，而光标和词块范围是双拼编码里的位置：letterMap[编码位置] = 拼音位置。
   // 空表示 letters 就是编码。
   var letterMap = [Int]()
-
-  func letterPosition(_ code: Int) -> Int {
-    guard !letterMap.isEmpty else { return code }
-    return letterMap[min(max(code, 0), letterMap.count - 1)]
-  }
-
-  // 拼音位置对应的编码位置：第一个拼音位置不小于它的编码位置，也就是落到所在音节的末尾。
-  func codePosition(_ letter: Int) -> Int {
-    guard !letterMap.isEmpty else { return letter }
-    return letterMap.firstIndex { $0 >= letter } ?? letterMap.count - 1
-  }
   var candidates = [NovaCandidate]()
   var highlighted = 0
+
+  init() {}
+
+  // 从 nova-ui 组装好的内容复制出来。
+  init(_ view: NovaUIContent) {
+    preedit = view.preedit.map { String(cString: $0) } ?? ""
+    selRange = view.sel_location >= 0 ? NSRange(location: Int(view.sel_location), length: Int(view.sel_length)) : .empty
+    blocks = (0..<Int(view.block_count)).map { NovaBlock(view.blocks[$0]) }
+    letters = view.letters.map { String(cString: $0) } ?? ""
+    cursor = Int(view.cursor)
+    letterMap = (0..<Int(view.letter_map_count)).map { Int(view.letter_map[$0]) }
+    candidates = (0..<Int(view.candidate_count)).map {
+      let candidate = view.candidates[$0]
+      return NovaCandidate(label: candidate.label.map { String(cString: $0) } ?? "",
+                           text: candidate.text.map { String(cString: $0) } ?? "",
+                           comment: candidate.comment.map { String(cString: $0) } ?? "")
+    }
+    highlighted = Int(view.highlighted)
+  }
 }
 
 struct NovaStyle {
@@ -116,6 +139,20 @@ struct NovaStyle {
 
   var labelFont: NSFont { .monospacedDigitSystemFont(ofSize: round(font.pointSize * 0.68), weight: .medium) }
   var shareFont: NSFont { .monospacedDigitSystemFont(ofSize: round(font.pointSize * 0.62), weight: .regular) }
+  var letterFont: NSFont { .monospacedSystemFont(ofSize: round(font.pointSize * 0.9), weight: .regular) }
+
+  fileprivate var cStyle: NovaUIStyle {
+    NovaUIStyle(font_size: Double(font.pointSize), linear: linear ? 1 : 0, show_share: showShare ? 1 : 0)
+  }
+
+  fileprivate func roleFont(_ role: NovaUIFont) -> NSFont {
+    switch role {
+    case NOVA_FONT_LABEL: labelFont
+    case NOVA_FONT_SHARE: shareFont
+    case NOVA_FONT_LETTER: letterFont
+    default: font
+    }
+  }
 }
 
 enum NovaAction: Equatable {
@@ -127,7 +164,7 @@ enum NovaAction: Equatable {
   case cursor(Int)
 }
 
-// 全部是实色，没有透明度和描边。
+// 全部是实色，没有透明度和描边。数值和 nova-ui 的默认调色板（nova_ui_default_color）一致。
 enum NovaPalette {
   static let blue = NSColor(srgbRed: 0x2f / 255, green: 0x6f / 255, blue: 0xde / 255, alpha: 1)
   static let orange = NSColor(srgbRed: 0xd2 / 255, green: 0x66 / 255, blue: 0x24 / 255, alpha: 1)
@@ -142,6 +179,104 @@ enum NovaPalette {
   static let primary = NSColor.white
   static let dim = NSColor(white: 0.62, alpha: 1)
   static let share = NSColor(white: 0.5, alpha: 1)
+
+  // nova-ui 的颜色语义 -> 这里的颜色。
+  fileprivate static func color(_ token: NovaUIColor) -> NSColor {
+    switch token {
+    case NOVA_COLOR_BLUE: blue
+    case NOVA_COLOR_ORANGE: orange
+    case NOVA_COLOR_PURPLE: purple
+    case NOVA_COLOR_GREEN: green
+    case NOVA_COLOR_FOCUS: focus
+    case NOVA_COLOR_ALT_FILL: altFill
+    case NOVA_COLOR_ALT_HOVER: altHover
+    case NOVA_COLOR_CARD: card
+    case NOVA_COLOR_BRANCH: branch
+    case NOVA_COLOR_PRIMARY: primary
+    case NOVA_COLOR_DIM: dim
+    case NOVA_COLOR_SHARE: share
+    default: .black
+    }
+  }
+}
+
+// 测宽回调要带的上下文：每个字体角色对应的字体。
+private final class NovaMeasurer {
+  let style: NovaStyle
+  init(style: NovaStyle) { self.style = style }
+}
+
+private func novaMeasure(_ text: UnsafePointer<CChar>?, _ role: NovaUIFont, _ user: UnsafeMutableRawPointer?) -> Double {
+  guard let text, let user else { return 0 }
+  let measurer = Unmanaged<NovaMeasurer>.fromOpaque(user).takeUnretainedValue()
+  let string = NSAttributedString(string: String(cString: text), attributes: [.font: measurer.style.roleFont(role)])
+  return Double(string.size().width)
+}
+
+// 把 NovaContent 摊成 nova-ui 的 C 结构；字符串和数组都由这个对象持有，用完一起释放。
+private final class NovaCContent {
+  private var strings = [UnsafeMutablePointer<CChar>]()
+  private var blocks = [NovaUIBlock]()
+  private var choices = [UnsafeMutablePointer<NovaUIChoice>]()
+  private var candidates = [NovaUICandidate]()
+  private var map = [Int32]()
+  private(set) var content = NovaUIContent()
+
+  private func cString(_ string: String) -> UnsafePointer<CChar> {
+    let pointer = strdup(string)!
+    strings.append(pointer)
+    return UnsafePointer(pointer)
+  }
+
+  private func choice(_ choice: NovaChoice) -> NovaUIChoice {
+    NovaUIChoice(text: cString(choice.text), has_share: choice.share == nil ? 0 : 1, share: Int32(choice.share ?? 0))
+  }
+
+  init(_ source: NovaContent) {
+    blocks = source.blocks.map { block in
+      let alternatives = UnsafeMutablePointer<NovaUIChoice>.allocate(capacity: max(block.alternatives.count, 1))
+      for (index, alternative) in block.alternatives.enumerated() {
+        (alternatives + index).initialize(to: choice(alternative))
+      }
+      choices.append(alternatives)
+      return NovaUIBlock(from: Int32(block.from), to: Int32(block.to), pinned: block.pinned ? 1 : 0, focused: block.focused ? 1 : 0,
+                         corrected: block.corrected ? 1 : 0, uncertain: block.uncertain ? 1 : 0, overview: block.overview ? 1 : 0,
+                         word: choice(block.word), alts: UnsafePointer(alternatives), alt_count: Int32(block.alternatives.count),
+                         page: cString(block.page), has_current: block.current == nil ? 0 : 1, current: Int32(block.current ?? 0),
+                         flags: cString(block.flags))
+    }
+    candidates = source.candidates.map { NovaUICandidate(label: cString($0.label), text: cString($0.text), comment: cString($0.comment)) }
+    map = source.letterMap.map { Int32($0) }
+    content.preedit = cString(source.preedit)
+    let valid = source.selRange.location != NSNotFound
+    content.sel_location = valid ? Int32(source.selRange.location) : -1
+    content.sel_length = Int32(source.selRange.length)
+    content.letters = cString(source.letters)
+    content.cursor = Int32(source.cursor)
+    content.highlighted = Int32(source.highlighted)
+  }
+
+  // 数组指针要等所有元素都放好再取。
+  func withContent<T>(_ body: (UnsafePointer<NovaUIContent>) -> T) -> T {
+    blocks.withUnsafeBufferPointer { blockBuffer in
+      candidates.withUnsafeBufferPointer { candidateBuffer in
+        map.withUnsafeBufferPointer { mapBuffer in
+          content.blocks = blockBuffer.baseAddress
+          content.block_count = Int32(blockBuffer.count)
+          content.candidates = candidateBuffer.baseAddress
+          content.candidate_count = Int32(candidateBuffer.count)
+          content.letter_map = mapBuffer.baseAddress
+          content.letter_map_count = Int32(mapBuffer.count)
+          return withUnsafePointer(to: &content, body)
+        }
+      }
+    }
+  }
+
+  deinit {
+    strings.forEach { free($0) }
+    choices.forEach { $0.deallocate() }
+  }
 }
 
 struct NovaLayout {
@@ -160,24 +295,8 @@ struct NovaLayout {
     let action: NovaAction
   }
 
-  static let cornerRadius: CGFloat = 10
-  static let edge: CGFloat = 10
-  private static let chipRadius: CGFloat = 6
-  private static let chipPadding: CGFloat = 8
-  private static let columnGap: CGFloat = 12
-  private static let linkHeight: CGFloat = 3
-  private static let branchIndent: CGFloat = 6
-  private static let altIndent: CGFloat = 16
-  private static let altPadding: CGFloat = 6
-  private static let altGap: CGFloat = 8
-  private static let busGap: CGFloat = 5
-  private static let spineOffset: CGFloat = 10
-  private static let branchRadius: CGFloat = 4
-  private static let labelGap: CGFloat = 4
-  private static let rowPadding: CGFloat = 6
-  private static let shareRow: CGFloat = 13
-  private static let altSpacing: CGFloat = 3
-  private static let maxAlts: CGFloat = 6
+  static let cornerRadius = CGFloat(nova_ui_corner_radius())
+  static let edge = CGFloat(nova_ui_edge())
 
   private(set) var size = NSSize.zero
   // 只有普通列表和状态消息有底色；树直接浮在文字下方，没有边缘可以跳动。
@@ -188,307 +307,59 @@ struct NovaLayout {
   private(set) var hits = [Hit]()
   let branches = NSBezierPath()
 
-  private let style: NovaStyle
   // 放在光标上方时，词块贴着光标，备选往上长。
-  private let upward: Bool
-  private var bottom = NovaLayout.edge
-  private var right: CGFloat = 0
-
   init(content: NovaContent, style: NovaStyle, maxWidth: CGFloat, upward: Bool) {
-    self.style = style
-    self.upward = upward
-    card = content.blocks.isEmpty
-    addPreedit(content)
-    if content.blocks.isEmpty {
-      addCandidates(content, maxWidth: maxWidth)
-    } else {
-      // 字母行贴着输入的文字：面板在下方时放最上面，在上方时放最下面。
-      if !upward { addLetters(content) }
-      addTree(content.blocks, maxWidth: maxWidth)
-      if upward { addLetters(content) }
+    let source = NovaCContent(content)
+    var cStyle = style.cStyle
+    let measurer = NovaMeasurer(style: style)
+    let layout = source.withContent { pointer in
+      nova_ui_layout_create(pointer, &cStyle, novaMeasure, Unmanaged.passUnretained(measurer).toOpaque(), Double(maxWidth), upward ? 1 : 0)
     }
-    size = NSSize(width: ceil(right) + Self.edge, height: ceil(bottom) + Self.edge)
+    guard let layout, let view = nova_ui_layout_view(layout)?.pointee else { return }
+    defer { nova_ui_layout_free(layout) }
+    size = NSSize(width: view.width, height: view.height)
+    card = view.card != 0
+    func rect(_ rect: NovaUIRect) -> NSRect { NSRect(x: rect.x, y: rect.y, width: rect.width, height: rect.height) }
+    func box(_ box: NovaUIBox) -> Box { Box(rect: rect(box.rect), radius: box.radius, color: NovaPalette.color(box.color)) }
+    links = (0..<Int(view.link_count)).map { box(view.links[$0]) }
+    boxes = (0..<Int(view.box_count)).map { box(view.boxes[$0]) }
+    for index in 0..<Int(view.path_count) {
+      let segment = view.path[index]
+      switch segment.kind {
+      case NOVA_PATH_MOVE:
+        branches.move(to: NSPoint(x: segment.x, y: segment.y))
+      case NOVA_PATH_LINE:
+        branches.line(to: NSPoint(x: segment.x, y: segment.y))
+      default:
+        branches.curve(to: NSPoint(x: segment.x, y: segment.y), controlPoint1: NSPoint(x: segment.c1x, y: segment.c1y),
+                       controlPoint2: NSPoint(x: segment.c2x, y: segment.c2y))
+      }
+    }
+    runs = (0..<Int(view.run_count)).map { index in
+      let run = view.runs[index]
+      let text = NSMutableAttributedString(string: String(cString: run.text),
+                                           attributes: [.font: style.roleFont(run.font), .foregroundColor: NovaPalette.color(run.color)])
+      if run.hl_start >= 0 {
+        text.addAttribute(.foregroundColor, value: NovaPalette.color(run.hl_color), range: NSRange(location: Int(run.hl_start), length: Int(run.hl_end - run.hl_start)))
+      }
+      return Run(string: text, x: run.x, baseline: run.baseline)
+    }
+    hits = (0..<Int(view.hit_count)).map { index in
+      let hit = view.hits[index]
+      let action: NovaAction = switch hit.action {
+      case NOVA_ACTION_SELECT: .select(Int(hit.value))
+      case NOVA_ACTION_PIN: .pin(Int(hit.value))
+      case NOVA_ACTION_FOCUS: .focus(Int(hit.value))
+      default: .cursor(Int(hit.value))
+      }
+      return Hit(rect: rect(hit.rect), action: action)
+    }
   }
 
   // 词块加满备选的高度，用来判断光标下方放不放得下。
   static func fullHeight(style: NovaStyle) -> CGFloat {
-    let probe = NovaLayout(content: NovaContent(), style: style, maxWidth: 0, upward: false)
-    return edge * 2 + probe.chipHeight + probe.shareHeight + busGap + maxAlts * probe.altRowHeight
-  }
-}
-
-private extension NovaLayout {
-  struct AltCell {
-    let label: NSAttributedString
-    let text: NSAttributedString
-    let share: NSAttributedString?
-    let width: CGFloat
-  }
-  struct Column {
-    let index: Int
-    let block: NovaBlock
-    let chip: NSAttributedString
-    let chipWidth: CGFloat
-    let share: NSAttributedString?
-    let cells: [AltCell]
-    let firstLabel: Int
-  }
-  // 一排词块的竖向坐标。d 是离词块顶边的距离；往上长时整排上下翻转。
-  struct Tier {
-    let top: CGFloat
-    let height: CGFloat
-    let upward: Bool
-
-    func y(_ distance: CGFloat) -> CGFloat {
-      upward ? top + height - distance : top + distance
-    }
-    func rect(x: CGFloat, distance: CGFloat, width: CGFloat, height rowHeight: CGFloat) -> NSRect {
-      NSRect(x: x, y: upward ? y(distance) - rowHeight : y(distance), width: width, height: rowHeight)
-    }
-  }
-
-  var rowHeight: CGFloat { ceil(style.font.pointSize * 1.5) }
-  var chipHeight: CGFloat { ceil(style.font.pointSize * 1.6) }
-  var altHeight: CGFloat { ceil(style.font.pointSize * 1.5) }
-  var shareHeight: CGFloat { style.showShare ? Self.shareRow : 0 }
-  var altRowHeight: CGFloat { altHeight + (style.showShare ? Self.shareRow : Self.altSpacing) }
-
-  func string(_ text: String, _ font: NSFont, _ color: NSColor) -> NSAttributedString {
-    NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: color])
-  }
-
-  // 汉字的字面中心约在基线上方 0.38 em，让它落在行的正中。
-  func baseline(of rect: NSRect, font: NSFont) -> CGFloat {
-    rect.midY + font.pointSize * 0.38
-  }
-
-  mutating func addPreedit(_ content: NovaContent) {
-    guard !content.preedit.isEmpty else { return }
-    let length = content.preedit.utf16.count
-    let selected = content.selRange.location != NSNotFound && NSMaxRange(content.selRange) <= length ? content.selRange : nil
-    let text = NSMutableAttributedString(attributedString: string(content.preedit, style.font, selected == nil ? NovaPalette.primary : NovaPalette.dim))
-    if let selected {
-      text.addAttribute(.foregroundColor, value: NovaPalette.primary, range: selected)
-    }
-    let rect = NSRect(x: Self.edge, y: bottom, width: 0, height: rowHeight)
-    runs.append(Run(string: text, x: Self.edge, baseline: baseline(of: rect, font: style.font)))
-    right = max(right, Self.edge + text.size().width)
-    bottom += rowHeight
-    if !content.blocks.isEmpty || !content.candidates.isEmpty {
-      bottom += 6
-    }
-  }
-
-  var letterFont: NSFont { .monospacedSystemFont(ofSize: round(style.font.pointSize * 0.9), weight: .regular) }
-
-  // 原始字母一行：每块的字母下面画一条和词块同色的线，焦点块是黄色；光标是一根黄色竖线。
-  // 点一个字母，光标移到它前面。
-  mutating func addLetters(_ content: NovaContent) {
-    guard !content.letters.isEmpty else { return }
-    if upward { bottom += 6 }
-    let letters = Array(content.letters)
-    let width = ceil(string("m", letterFont, NovaPalette.primary).size().width)
-    let rect = NSRect(x: Self.edge + Self.chipPadding, y: bottom, width: width * CGFloat(letters.count), height: rowHeight)
-    let line = baseline(of: rect, font: letterFont)
-    // 字母是白色，铺一块深色底，在浅色窗口上也看得见。
-    boxes.append(Box(rect: rect.insetBy(dx: -Self.chipPadding, dy: 0), radius: Self.chipRadius, color: NovaPalette.altFill))
-    let covered = Set(content.blocks.flatMap { block in
-      Array(content.letterPosition(block.from)..<max(content.letterPosition(block.from), content.letterPosition(block.to)))
-    })
-    for (index, letter) in letters.enumerated() {
-      let x = rect.minX + CGFloat(index) * width
-      runs.append(Run(string: string(String(letter), letterFont, covered.contains(index) ? NovaPalette.primary : NovaPalette.dim),
-                      x: x, baseline: line))
-      // 光标落在点的字母后面：焦点按光标前一个字母算。
-      hits.append(Hit(rect: NSRect(x: x, y: rect.minY, width: width, height: rect.height), action: .cursor(content.codePosition(index + 1))))
-    }
-    for block in content.blocks where block.to > block.from {
-      let from = content.letterPosition(block.from), to = content.letterPosition(block.to)
-      let x = rect.minX + CGFloat(from) * width
-      boxes.append(Box(rect: NSRect(x: x + 1, y: rect.maxY - 5, width: CGFloat(to - from) * width - 2, height: 2),
-                       radius: 0, color: block.focused ? NovaPalette.focus : block.color))
-    }
-    let cursorX = rect.minX + CGFloat(min(max(content.letterPosition(content.cursor), 0), letters.count)) * width
-    boxes.append(Box(rect: NSRect(x: cursorX - 1, y: rect.minY + 3, width: 2, height: rect.height - 6), radius: 1, color: NovaPalette.focus))
-    right = max(right, rect.maxX + Self.chipPadding)
-    bottom += rowHeight
-    if !upward { bottom += 6 }
-  }
-
-  // 词块只按自身宽度排在一条连线上，放不下时另起一排。
-  mutating func addTree(_ blocks: [NovaBlock], maxWidth: CGFloat) {
-    let limit = maxWidth - Self.edge * 2
-    var tiers = [[Column]]()
-    var tierWidth: CGFloat = 0
-    let hasFocus = blocks.contains(where: \.focused)
-    var label = 1
-    for (index, block) in blocks.enumerated() {
-      let shows = hasFocus ? block.focused : block.overview
-      let column = measure(block, index: index, firstLabel: hasFocus ? 1 : label, shows: shows)
-      if shows && !hasFocus {
-        label += block.alternatives.count
-      }
-      if tiers.isEmpty || tierWidth + column.chipWidth > limit {
-        tiers.append([])
-        tierWidth = 0
-      }
-      tiers[tiers.count - 1].append(column)
-      tierWidth += column.chipWidth + Self.columnGap
-    }
-    for (index, tier) in tiers.enumerated() {
-      if index > 0 {
-        bottom += 8
-      }
-      addTier(tier)
-    }
-  }
-
-  func altCell(_ choice: NovaChoice, label number: Int) -> AltCell {
-    let label = string("\(number)", style.labelFont, NovaPalette.dim)
-    let text = string(choice.text, style.font, NovaPalette.primary)
-    let share = style.showShare ? choice.share.map { string("\($0)", style.shareFont, NovaPalette.share) } : nil
-    let width = Self.altPadding * 2 + ceil(label.size().width) + Self.labelGap + ceil(text.size().width)
-    return AltCell(label: label, text: text, share: share, width: width)
-  }
-
-  func measure(_ block: NovaBlock, index: Int, firstLabel: Int, shows: Bool) -> Column {
-    let chip = string(block.word.text, style.font, block.focused ? .black : NovaPalette.primary)
-    let chipWidth = ceil(chip.size().width) + Self.chipPadding * 2
-    let cells = shows ? block.alternatives.enumerated().map { altCell($0.element, label: firstLabel + $0.offset) } : []
-    let share = style.showShare ? block.word.share.map { string("\($0)", style.shareFont, NovaPalette.share) } : nil
-    return Column(index: index, block: block, chip: chip, chipWidth: chipWidth, share: share, cells: cells, firstLabel: firstLabel)
-  }
-
-  mutating func addTier(_ columns: [Column]) {
-    let depth = columns.map(\.cells.count).max() ?? 0
-    let altsHeight = depth > 0 ? Self.busGap + CGFloat(depth) * altRowHeight : 0
-    let tier = Tier(top: bottom, height: chipHeight + shareHeight + altsHeight, upward: upward)
-    var x = Self.edge
-    var previousEnd: CGFloat?
-    var altFloor: CGFloat = 0
-    for column in columns {
-      if let previousEnd {
-        // 连线伸进两边的词块下面，避开圆角处的缝。
-        let chip = tier.rect(x: 0, distance: 0, width: 0, height: chipHeight)
-        links.append(Box(rect: NSRect(x: previousEnd - 2, y: chip.midY - Self.linkHeight / 2, width: x - previousEnd + 4, height: Self.linkHeight),
-                         radius: 0, color: column.block.color))
-      }
-      addChip(column, x: x, tier: tier)
-      addAlternatives(column, x: x, tier: tier, floor: &altFloor)
-      previousEnd = x + column.chipWidth
-      right = max(right, x + column.chipWidth)
-      x += column.chipWidth + Self.columnGap
-    }
-    bottom = tier.top + tier.height
-  }
-
-  mutating func addChip(_ column: Column, x: CGFloat, tier: Tier) {
-    let rect = tier.rect(x: x, distance: 0, width: column.chipWidth, height: chipHeight)
-    // 焦点块换底色，不用描边。
-    boxes.append(Box(rect: rect, radius: Self.chipRadius, color: column.block.focused ? NovaPalette.focus : column.block.color))
-    hits.append(Hit(rect: rect, action: .focus(column.index)))
-    runs.append(Run(string: column.chip, x: x + Self.chipPadding, baseline: baseline(of: rect, font: style.font)))
-    if let share = column.share {
-      let row = tier.rect(x: x, distance: chipHeight, width: column.chipWidth, height: shareHeight)
-      runs.append(Run(string: share, x: x + (column.chipWidth - ceil(share.size().width)) / 2, baseline: baseline(of: row, font: style.shareFont)))
-    }
-  }
-
-  // 备选放不下时往右让，用一条横线接回词块。
-  mutating func addAlternatives(_ column: Column, x: CGFloat, tier: Tier, floor altFloor: inout CGFloat) {
-    guard !column.cells.isEmpty else { return }
-    let cellX = max(x + Self.altIndent, altFloor)
-    let width = column.cells.map(\.width).max() ?? 0
-    let spine = cellX - Self.spineOffset
-    let firstRow = chipHeight + shareHeight + Self.busGap
-    let bus = tier.y(firstRow - Self.busGap / 2)
-    branches.move(to: NSPoint(x: x + Self.branchIndent, y: tier.y(chipHeight)))
-    branches.line(to: NSPoint(x: x + Self.branchIndent, y: bus))
-    branches.line(to: NSPoint(x: spine, y: bus))
-    for (row, cell) in column.cells.enumerated() {
-      let distance = firstRow + CGFloat(row) * altRowHeight
-      let rect = tier.rect(x: cellX, distance: distance, width: width, height: altHeight)
-      addBranch(spine: spine, from: bus, toX: cellX, y: rect.midY)
-      // ↓/↑ 换上的那一项铺蓝色，和普通列表的高亮一样。
-      boxes.append(Box(rect: rect, radius: 5, color: column.block.current == row + 1 ? NovaPalette.blue : NovaPalette.altFill))
-      hits.append(Hit(rect: rect, action: .pin(column.firstLabel + row)))
-      let line = baseline(of: rect, font: style.font)
-      var cursor = cellX + Self.altPadding
-      for run in [cell.label, cell.text] {
-        runs.append(Run(string: run, x: cursor, baseline: line))
-        cursor += ceil(run.size().width) + Self.labelGap
-      }
-      if let share = cell.share {
-        let shareRect = tier.rect(x: cellX, distance: distance + altHeight, width: width, height: shareHeight)
-        runs.append(Run(string: share, x: rect.midX - ceil(share.size().width) / 2, baseline: baseline(of: shareRect, font: style.shareFont)))
-      }
-    }
-    // 分页时在最后一个备选右边标出页码，-/= 或 ,/. 翻页。
-    if !column.block.page.isEmpty, let last = column.cells.indices.last {
-      let rect = tier.rect(x: cellX, distance: firstRow + CGFloat(last) * altRowHeight, width: width, height: altHeight)
-      let page = string("‹ \(column.block.page) ›", style.labelFont, NovaPalette.dim)
-      runs.append(Run(string: page, x: cellX + width + Self.altGap, baseline: baseline(of: rect, font: style.labelFont)))
-      right = max(right, cellX + width + Self.altGap + ceil(page.size().width))
-    }
-    right = max(right, cellX + width)
-    altFloor = cellX + width + Self.altGap
-  }
-
-  func addBranch(spine: CGFloat, from: CGFloat, toX end: CGFloat, y: CGFloat) {
-    let radius = min(Self.branchRadius, end - spine)
-    let corner = NSPoint(x: spine, y: y)
-    branches.move(to: NSPoint(x: spine, y: from))
-    branches.line(to: NSPoint(x: spine, y: y > from ? y - radius : y + radius))
-    branches.curve(to: NSPoint(x: spine + radius, y: y), controlPoint1: corner, controlPoint2: corner)
-    branches.line(to: NSPoint(x: end, y: y))
-  }
-
-  // 普通候选列表：竖排或横排，高亮的一项铺底色。
-  mutating func addCandidates(_ content: NovaContent, maxWidth: CGFloat) {
-    struct Entry {
-      let label: NSAttributedString
-      let text: NSAttributedString
-      let comment: NSAttributedString
-      let width: CGFloat
-    }
-    let entries = content.candidates.map { candidate -> Entry in
-      let label = string(candidate.label, style.labelFont, NovaPalette.dim)
-      let text = string(candidate.text, style.font, NovaPalette.primary)
-      let comment = string(candidate.comment, style.labelFont, NovaPalette.dim)
-      var width = Self.rowPadding * 2 + ceil(text.size().width)
-      width += candidate.label.isEmpty ? 0 : ceil(label.size().width) + Self.labelGap
-      width += candidate.comment.isEmpty ? 0 : ceil(comment.size().width) + Self.labelGap
-      return Entry(label: label, text: text, comment: comment, width: width)
-    }
-    let uniform = style.linear ? nil : entries.map(\.width).max()
-    var x = Self.edge
-    let limit = maxWidth - Self.edge
-    var rowTop = bottom
-    for (index, entry) in entries.enumerated() {
-      let width = uniform ?? entry.width
-      if x > Self.edge && x + width > limit {
-        x = Self.edge
-        rowTop += rowHeight
-      }
-      let rect = NSRect(x: x, y: rowTop, width: width, height: rowHeight)
-      if index == content.highlighted {
-        boxes.append(Box(rect: rect, radius: Self.chipRadius, color: NovaPalette.blue))
-      }
-      hits.append(Hit(rect: rect, action: .select(index)))
-      let line = baseline(of: rect, font: style.font)
-      var cursor = x + Self.rowPadding
-      for run in [entry.label, entry.text, entry.comment] where run.length > 0 {
-        runs.append(Run(string: run, x: cursor, baseline: line))
-        cursor += ceil(run.size().width) + Self.labelGap
-      }
-      right = max(right, x + width)
-      if style.linear {
-        x += width
-      } else {
-        rowTop += rowHeight
-      }
-    }
-    bottom = style.linear || entries.isEmpty ? rowTop + (entries.isEmpty ? 0 : rowHeight) : rowTop
+    var cStyle = style.cStyle
+    return CGFloat(nova_ui_full_height(&cStyle))
   }
 }
 

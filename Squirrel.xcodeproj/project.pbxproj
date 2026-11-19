@@ -86,6 +86,9 @@
 		D26434552706A15100857391 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D26434542706A15100857391 /* QuartzCore.framework */; };
 		E93074B70A5C264700470842 /* InputMethodKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = E93074B60A5C264700470842 /* InputMethodKit.framework */; };
 		F45E005F2B8CA81C00179B75 /* UserNotifications.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F45E005E2B8CA81C00179B75 /* UserNotifications.framework */; };
+		A10E00020000000000000000 /* model.cc in Sources */ = {isa = PBXBuildFile; fileRef = A10E00010000000000000000 /* model.cc */; settings = {COMPILER_FLAGS = "-std=c++17 -ffp-contract=off"; }; };
+		A10E00040000000000000000 /* layout.cc in Sources */ = {isa = PBXBuildFile; fileRef = A10E00030000000000000000 /* layout.cc */; settings = {COMPILER_FLAGS = "-std=c++17 -ffp-contract=off"; }; };
+		A10E00060000000000000000 /* rime_glue.cc in Sources */ = {isa = PBXBuildFile; fileRef = A10E00050000000000000000 /* rime_glue.cc */; settings = {COMPILER_FLAGS = "-std=c++17 -ffp-contract=off -DNOVA_UI_RIME_STDBOOL"; }; };
 /* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -288,6 +291,9 @@
 		D26434542706A15100857391 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
 		E93074B60A5C264700470842 /* InputMethodKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = InputMethodKit.framework; path = /System/Library/Frameworks/InputMethodKit.framework; sourceTree = "<absolute>"; };
 		F45E005E2B8CA81C00179B75 /* UserNotifications.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UserNotifications.framework; path = System/Library/Frameworks/UserNotifications.framework; sourceTree = SDKROOT; };
+		A10E00010000000000000000 /* model.cc */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = model.cc; path = nova-ui/src/model.cc; sourceTree = "<group>"; };
+		A10E00030000000000000000 /* layout.cc */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = layout.cc; path = nova-ui/src/layout.cc; sourceTree = "<group>"; };
+		A10E00050000000000000000 /* rime_glue.cc */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = rime_glue.cc; path = nova-ui/src/rime_glue.cc; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -314,6 +320,9 @@
 				B397712E2BEECBED0093A49B /* Main.swift */,
 				B39771262BED9B250093A49B /* NovaLayout.swift */,
 				B397712A2BEE4C160093A49B /* NovaPanel.swift */,
+				A10E00010000000000000000 /* model.cc */,
+				A10E00030000000000000000 /* layout.cc */,
+				A10E00050000000000000000 /* rime_glue.cc */,
 				B39771242BED899F0093A49B /* SquirrelConfig.swift */,
 				B35D2FE72BF00839009D156B /* BridgingFunctions.swift */,
 				B38E9B8F2BE9AE1E0036ABEF /* Squirrel-Bridging-Header.h */,
@@ -574,6 +583,9 @@
 				B397712B2BEE4C160093A49B /* NovaPanel.swift in Sources */,
 				B38E9B912BE9AE1E0036ABEF /* SquirrelApplicationDelegate.swift in Sources */,
 				B39771272BED9B250093A49B /* NovaLayout.swift in Sources */,
+				A10E00020000000000000000 /* model.cc in Sources */,
+				A10E00040000000000000000 /* layout.cc in Sources */,
+				A10E00060000000000000000 /* rime_glue.cc in Sources */,
 				B35D2FE82BF00839009D156B /* BridgingFunctions.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

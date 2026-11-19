@@ -7,7 +7,9 @@
 #pragma once
 
 #include <cstdlib>
+#ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
+#endif
 #include <ggml-alloc.h>
 #include <ggml-backend.h>
 #include <ggml.h>
@@ -35,13 +37,15 @@ class TreeLM {
   // cap = number of KV cells (tree nodes, context included) kept at once.
   // backend_dir: where the ggml CPU backend libraries are (libggml-cpu-*.so); empty means
   // ggml's built-in search path.
-  bool load(const std::string &path, int threads, int cap, const std::string &backend_dir = "") {
+  bool load(const std::string &path, int threads, int cap, const std::string &backend_dir = "", bool want_ent = false) {
     // The CPU backend runs on libomp, whose workers busy-wait 200 ms after each parallel region by default.
     // In an input method that burns several cores after every key. 0 is slower (a graph wakes
     // the workers many times); 5 ms keeps them warm within one key: 400 typed sentences give
     // p50/p99 3.5/7.2 ms against 4.2/10.0 at 200 and 8.0/12.3 at 0. Read when libomp starts;
     // a setting already in the environment wins.
+#ifndef _WIN32
     setenv("KMP_BLOCKTIME", "5", 0);
+#endif
     if (!backend_dir.empty()) ggml_backend_load_all_from_path(backend_dir.c_str());
     if (!ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) ggml_backend_load_all();
     be_ = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -58,6 +62,18 @@ class TreeLM {
             reg, "ggml_backend_dev_get_extra_bufts"))
       for (auto *b = fx(dev); b && *b; b++)
         if (strstr(ggml_backend_buft_name(*b), "REPACK")) repack = *b;
+    // ggml repacks Q8_0 only for ARM (NEON with i8mm or dotprod). On x86 a Q8_0 tensor in the repack buffer gets no
+    // traits (extra == nullptr), and loading it or the first matmul then dereferences null. Use the buffer only where
+    // ggml has a layout for the weights.
+    if (repack) {
+      bool neon = false, i8mm_or_dot = false;
+      if (auto gf = (ggml_backend_get_features_t)ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_features"))
+        for (auto *ft = gf(reg); ft && ft->name; ft++) {
+          if (!strcmp(ft->name, "NEON")) neon = true;
+          if (!strcmp(ft->name, "MATMUL_INT8") || !strcmp(ft->name, "DOTPROD")) i8mm_or_dot = true;
+        }
+      if (!(neon && i8mm_or_dot)) repack = nullptr;
+    }
 
     ggml_context *meta = nullptr;
     gguf_init_params gp{true, &meta};
@@ -73,6 +89,17 @@ class TreeLM {
     int64_t tk = gguf_find_key(g, "tokenizer.ggml.tokens");
     if (!L_ || !D_ || !NH_ || tk < 0) { gguf_free(g); ggml_free(meta); return false; }
     for (size_t i = 0, n = gguf_get_arr_n(g, tk); i < n; i++) tokens_.push_back(gguf_get_arr_str(g, tk, i));
+    // Entity head (nova.ent.*, see ent_probs); a file without it, or with one this code does not know, just has no head.
+    bool ent_meta = false;
+    {
+      int64_t et = gguf_find_key(g, "nova.ent.tags");
+      static const char *kTags[] = {"O", "B-PER", "I-PER", "B-LOC", "I-LOC"};
+      ent_meta = et >= 0 && gguf_get_arr_n(g, et) == 5;
+      for (int i = 0; ent_meta && i < 5; i++) ent_meta = !strcmp(gguf_get_arr_str(g, et, i), kTags[i]);
+      ent_layer_ = u32("nova.ent.layer");
+      ent_h_ = u32("nova.ent.hidden");
+      ent_meta = ent_meta && u32("nova.ent.window") == 3;
+    }
 
     int64_t nt = gguf_get_n_tensors(g);
     ggml_init_params ip{ggml_tensor_overhead() * (nt + 1), nullptr, true};
@@ -121,6 +148,11 @@ class TreeLM {
     if (!wte_ || !wpe_ || !out_) return false;
     V_ = (int)wte_->ne[1];
     npos_ = (int)wpe_->ne[1];
+    fc1_ = W("ent.fc1.w"); fb1_ = W("ent.fc1.bias"); fc2_ = W("ent.fc2.w"); fb2_ = W("ent.fc2.bias");
+    ent_ok_ = want_ent && ent_meta && fc1_ && fb1_ && fc2_ && fb2_ && ent_layer_ >= 1 && ent_layer_ < L_ && ent_h_ > 0 &&
+              fc1_->type == GGML_TYPE_F32 && fc2_->type == GGML_TYPE_F32 && fb1_->type == GGML_TYPE_F32 &&
+              fb2_->type == GGML_TYPE_F32 && fc1_->ne[0] == 3 * D_ + 2 && fc1_->ne[1] == ent_h_ &&
+              fc2_->ne[0] == ent_h_ && fc2_->ne[1] == 5 && fb1_->ne[0] == ent_h_ && fb2_->ne[0] == 5;
 
     cap_ = cap;
     ggml_init_params kp{ggml_tensor_overhead() * (2 * L_ + 1), nullptr, true};
@@ -138,6 +170,58 @@ class TreeLM {
   }
 
   const std::vector<std::string> &tokens() const { return tokens_; }
+  bool has_ent() const { return ent_ok_; }
+
+  // Entity head. Per character k of a sentence (chain[k] = flushed node whose token is character k, so the
+  // chain is the sentence's own prefixes): the residual stream after `nova.ent.layer` blocks, LayerNorm without
+  // parameters, e_k; input [e_k, e_k+1, e_k+2, has k+1, has k+2] with a missing state 0; Linear -> GELU -> Linear;
+  // softmax over O, B-PER, I-PER, B-LOC, I-LOC. out[5 * k + t]. The first Linear splits by input block, so each
+  // node keeps W_j e (3 x hidden) the first time it is read and a character costs three additions.
+  bool ent_probs(const std::vector<int> &chain, std::vector<float> *out) {
+    if (!ent_ok_) return false;
+    const int n = (int)chain.size(), H = ent_h_, ld = 3 * D_ + 2;
+    const float *W1 = (const float *)fc1_->data, *b1 = (const float *)fb1_->data;
+    const float *W2 = (const float *)fc2_->data, *b2 = (const float *)fb2_->data;
+    for (int c : chain) {
+      Node &nd = nodes_[c];
+      if ((int)nd.e.size() != D_) return false;
+      if (!nd.proj.empty()) continue;
+      nd.proj.resize(3 * H);
+      for (int j = 0; j < 3; j++)
+#ifdef __APPLE__
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, H, D_, 1.f, W1 + j * D_, ld, nd.e.data(), 1, 0.f, nd.proj.data() + j * H, 1);
+#else
+        for (int r = 0; r < H; r++) {
+          double acc = 0;
+          const float *w = W1 + j * D_ + (size_t)r * ld;
+          for (int k = 0; k < D_; k++) acc += (double)w[k] * nd.e[k];
+          nd.proj[j * H + r] = (float)acc;
+        }
+#endif
+    }
+    out->assign((size_t)n * 5, 0.f);
+    std::vector<float> pre(H);
+    for (int k = 0; k < n; k++) {
+      const float *p0 = nodes_[chain[k]].proj.data();
+      const float *p1 = k + 1 < n ? nodes_[chain[k + 1]].proj.data() + H : nullptr;
+      const float *p2 = k + 2 < n ? nodes_[chain[k + 2]].proj.data() + 2 * H : nullptr;
+      for (int r = 0; r < H; r++) {
+        float v = b1[r] + p0[r];
+        if (p1) v += p1[r] + W1[(size_t)r * ld + 3 * D_];
+        if (p2) v += p2[r] + W1[(size_t)r * ld + 3 * D_ + 1];
+        pre[r] = 0.5f * v * (1.f + std::erf(v * 0.70710678118654752f));
+      }
+      float lg[5], mx = -INFINITY, sum = 0;
+      for (int t = 0; t < 5; t++) {
+        lg[t] = b2[t];
+        for (int r = 0; r < H; r++) lg[t] += W2[(size_t)t * H + r] * pre[r];
+        mx = std::max(mx, lg[t]);
+      }
+      for (int t = 0; t < 5; t++) sum += (lg[t] = std::exp(lg[t] - mx));
+      for (int t = 0; t < 5; t++) (*out)[(size_t)5 * k + t] = lg[t] / sum;
+    }
+    return true;
+  }
   int size() const { return (int)nodes_.size(); }
   int max_pos() const { return npos_; }
 
@@ -163,7 +247,13 @@ class TreeLM {
     if (wte_->type == GGML_TYPE_F32) memcpy(row_.data(), src, D_ * sizeof(float));
     else ggml_get_type_traits(wte_->type)->to_float(src, row_.data(), D_);
     float s;
+#ifdef __APPLE__
     vDSP_dotpr(row_.data(), 1, p.h.data(), 1, &s, D_);
+#else
+    double acc = 0;
+    for (int k = 0; k < D_; k++) acc += (double)row_[k] * p.h[k];
+    s = (float)acc;
+#endif
     return s - p.lse;
   }
 
@@ -181,6 +271,7 @@ class TreeLM {
     ggml_set_input(mask);
     const int hd = D_ / NH_;
     ggml_tensor *x = ggml_add(ctx, ggml_get_rows(ctx, wte_, tok), ggml_get_rows(ctx, wpe_, pos));
+    ggml_tensor *ent_x = nullptr;
     char nm[64];
     auto Wl = [&](const char *fmt, int l) { snprintf(nm, sizeof nm, fmt, l); return W(nm); };
     for (int l = 0; l < L_; l++) {
@@ -204,6 +295,10 @@ class TreeLM {
       h = ggml_gelu(ctx, ggml_add(ctx, ggml_mul_mat(ctx, Wl("blk.%d.ffn_up.weight", l), h), Wl("blk.%d.ffn_up.bias", l)));
       h = ggml_add(ctx, ggml_mul_mat(ctx, Wl("blk.%d.ffn_down.weight", l), h), Wl("blk.%d.ffn_down.bias", l));
       x = ggml_add(ctx, x, h);
+      if (ent_ok_ && l + 1 == ent_layer_) {
+        ent_x = ggml_norm(ctx, x, 1e-5f);  // F.layer_norm(h, (768,)): no weight, no bias
+        ggml_set_output(ent_x);
+      }
     }
     x = ggml_norm(ctx, x, 1e-5f);
     x = ggml_add(ctx, ggml_mul(ctx, x, W("output_norm.weight")), W("output_norm.bias"));
@@ -212,6 +307,7 @@ class TreeLM {
     ggml_set_output(logits);
     ggml_build_forward_expand(gf, x);
     ggml_build_forward_expand(gf, logits);
+    if (ent_x) ggml_build_forward_expand(gf, ent_x);
     ggml_gallocr_alloc_graph(galloc_, gf);
 
     std::vector<int32_t> tv(n), pv(n);
@@ -232,14 +328,30 @@ class TreeLM {
     for (int r = 0; r < n; r++) {
       Node &nd = nodes_[c0 + r];
       nd.h.assign(hx + (size_t)r * D_, hx + (size_t)(r + 1) * D_);
+      if (ent_x) {
+        const float *ex = (const float *)ent_x->data;
+        nd.e.assign(ex + (size_t)r * D_, ex + (size_t)(r + 1) * D_);
+      }
       const float *row = lg + (size_t)r * V_;
       float mx, sum, neg;
+#ifdef __APPLE__
       vDSP_maxv(row, 1, &mx, V_);
       neg = -mx;
       vDSP_vsadd(row, 1, &neg, ebuf_.data(), 1, V_);
       int nv = V_;
       vvexpf(ebuf_.data(), ebuf_.data(), &nv);
       vDSP_sve(ebuf_.data(), 1, &sum, V_);
+#else
+      mx = row[0];
+      for (int k = 1; k < V_; k++) mx = std::max(mx, row[k]);
+      neg = -mx;
+      double acc = 0;
+      for (int k = 0; k < V_; k++) {
+        ebuf_[k] = std::exp(row[k] + neg);
+        acc += ebuf_[k];
+      }
+      sum = (float)acc;
+#endif
       nd.lse = mx + std::log(sum);
     }
     ggml_free(ctx);
@@ -256,6 +368,7 @@ class TreeLM {
     int parent, pos, tok;
     float lse;
     std::vector<float> h;
+    std::vector<float> e, proj;  // entity head: layer-norm'd residual stream, and its three projections (lazy)
   };
   int L_ = 0, D_ = 0, NH_ = 0, V_ = 0, npos_ = 0, cap_ = 0, done_ = 0;
   ggml_backend_t be_ = nullptr;
@@ -263,6 +376,9 @@ class TreeLM {
   ggml_backend_buffer_t wbuf_ = nullptr, rbuf_ = nullptr, kbuf_ = nullptr;
   ggml_gallocr_t galloc_ = nullptr;
   ggml_tensor *wte_ = nullptr, *wpe_ = nullptr, *out_ = nullptr;
+  ggml_tensor *fc1_ = nullptr, *fb1_ = nullptr, *fc2_ = nullptr, *fb2_ = nullptr;
+  bool ent_ok_ = false;
+  int ent_layer_ = 0, ent_h_ = 0;
   std::vector<ggml_tensor *> kc_, vc_;
   std::vector<Node> nodes_;
   std::vector<std::string> tokens_;

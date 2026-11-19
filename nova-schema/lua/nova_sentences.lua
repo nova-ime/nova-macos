@@ -203,10 +203,10 @@ end
 
 -- 树状候选 ----------------------------------------------------------------
 -- nova_tree 属性：每块一行，`标记\t起\t止\t键\t文字\t备选...`，起止是段内字节偏移。
---   标记末尾的 a数字 是这块已经稳定了几个音节，见 frozen_lines。
+--   标记末尾的 a数字 是这块已经稳定了几个音节（只供 nova_lm 合并人名用，不再决定冻结）。
 --   标记：首字符 1 表示用户选过，0 表示没有；含 f 是焦点块；含 c 是整句解码选了词频较低的词；
 --   含 o 是没有焦点时直接显示备选的不确定块，数字键从左到右连续编号；含 u 是解码器拿不准（面板标橙）；
---   含 s 是冻结的块（自动冻结，或选词时冻结的前文），nova_lm_filter 重选首选时不动它；
+--   含 s 是冻结的块（学到的切分，或选词时冻结的前文），nova_lm_filter 重选首选时不动它；
 --   含 x 是辅助码筛完还剩几个字、列成备选等用户选的块，见 choose_by_aux；
 --   含 t 是打错键后原样留下的字母块，见 tail_line。
 --   a数字 后面还可以跟 p页码/总页数（焦点块的备选分页时）和 h序号（↓/↑ 换词时当前用的是这一页第几个）。
@@ -352,7 +352,7 @@ local function split_blocks(env, tokens, first, last, text, blocks)
     end
 end
 
--- extra 是自动冻结的块，写在用户的固定段前面，同一位置以用户的为准。
+-- extra 是原样保留的块（学到的切分，或输入没变时的整棵树），写在用户的固定段前面，同一位置以用户的为准。
 local function parse_pins(env, tokens, offsets, input, extra)
     local value = (extra or "") .. (env.engine.context:get_property("nova_pins") or "")
     local start_at, end_at, aux_end_at = {}, {}, {}
@@ -369,7 +369,7 @@ local function parse_pins(env, tokens, offsets, input, extra)
         local from, to = tonumber(from_s), tonumber(to_s)
         local i, j = start_at[from], end_at[to]
         -- 用户选好的字不因后补的辅助码作废，前提是辅助码和它对得上（货号 + K）；
-        -- 对不上（选了好又补 K）说明用户要换字，和自动冻结的段一样按辅助码重新筛选。
+        -- 对不上（选了好又补 K）说明用户要换字，和 s 段一样按辅助码重新筛选。
         if not j and kind == "h" and i and aux_end_at[to] then
             local k = aux_end_at[to]
             for _, word in ipairs(words_from(env, tokens, i)[k - i + 1] or {}) do
@@ -818,15 +818,15 @@ local function token_offsets(tokens)
     return offsets
 end
 
--- 打过去的词不再跟着后面的字变。上一次的树里，除了最后一块，多字词满足其一就冻结：
---   有把握（占比够高），或者之后又打了 STABLE_SYLLABLES 个音节都没变（用户看过、认了）。
--- 单字和刚出现的没把握的词照样跟着整句解码变（无党 → 武当、无 → 武当）。
--- 输入没变时（移动焦点、选词后刷新），或者只多了一个没打完的字母，整棵树原样保留，
--- 不然同一个输入会来回跳，半个音节也会让前面的词闪一下。
-local FREEZE_SHARE = 50
-local STABLE_SYLLABLES = 2
+-- 打过去的词会跟着后面的字重新解码：没有自动冻结，不管占比多高、稳定了几个音节都一样，
+-- 这样前面写错的词能被后面的字改对。只有这几种不再动：
+--   用户选过的块（nova_pins 里的 h）；
+--   学到的切分（nova_bounds，见 apply_bounds）：上一次用上的左右两块接着保留（最后一块也是），
+--   免得后面的字把它并进更长的词（报道 + 查 → 道查）；
+--   输入没变时（移动焦点、选词后刷新），或者只多了一个没打完的字母，整棵树原样保留，
+--   不然同一个输入会来回跳，半个音节也会让前面的词闪一下。
 
--- 上一次的树：每块的字段和它已经稳定了几个音节（标记里的数字）。
+-- 上一次的树：每块的字段和它已经稳定了几个音节（标记里的数字，现在只供 nova_lm 合并人名用）。
 local function previous_blocks(previous)
     local blocks = {}
     for line in previous:gmatch("[^\n]+") do
@@ -841,25 +841,24 @@ local function previous_blocks(previous)
     return blocks
 end
 
--- open_from 是刚选的词的起点：只冻结它前面的块，后面的跟着新选的字重新解码。
--- groups 是上一次的树里解码器每个词的字节范围（`起:止` 每行一个）。一个词按词表切成几块时，
--- 最后那个词的几块都算「最后一块」，不冻结：这个词还没打完，后面的字可能把它整个改掉（一边我 → 以便我）。
-local function last_group_from(previous, groups)
-    local last = previous[#previous]
-    if not (last and groups) then return nil end
-    for from, to in groups:gmatch("(%d+):(%d+)") do
-        if to == last.to then return tonumber(from) end
+-- 上一次 apply_bounds 用上的学到的边界（nova_bounds_used：`边界的字节偏移:左编码:右编码`）
+-- 两侧的块，键是 `起:止:编码`。
+local function learned_blocks(used)
+    local keys = {}
+    for at, left, right in (used or ""):gmatch("(%d+):(%a+):(%a+)") do
+        local middle = tonumber(at)
+        keys[string.format("%d:%d:%s", middle - #left, middle, left)] = true
+        keys[string.format("%d:%d:%s", middle, middle + #right, right)] = true
     end
-    return nil
+    return keys
 end
 
-local function frozen_lines(previous, same_input, open_from, groups)
+-- open_from 是刚选的词的起点：它后面的块不再原样保留，跟着新选的字重新解码。
+local function frozen_lines(previous, same_input, open_from, bounds_used)
     local lines = {}
-    local open_group = last_group_from(previous, groups)
+    local learned = learned_blocks(bounds_used)
     for i, block in ipairs(previous) do
-        local settled = i < #previous and utf8.len(block.text) >= 2
-            and not (open_group and tonumber(block.from) >= open_group)
-            and (block.share >= FREEZE_SHARE or block.age >= STABLE_SYLLABLES)
+        local settled = learned[block.from .. ":" .. block.to .. ":" .. block.key]
         local opened = open_from and tonumber(block.to) > open_from
         if (same_input or settled) and not opened then
             lines[#lines + 1] = string.format("%s:%s:%s:s:%s\n", block.from, block.to, block.key, block.text)
@@ -979,7 +978,7 @@ local function build_tree(env, tokens, seg, cand, stop)
     -- 焦点移上去文字就变回解码器的写法，移开又变回去。
     if open_from then context:set_property("nova_open_from", "") end
     local frozen = frozen_lines(previous, same_input or stop ~= seg._end, open_from,
-                                context:get_property("nova_tree_groups"))
+                                context:get_property("nova_bounds_used"))
     local pins = parse_pins(env, tokens, offsets, context.input:sub(seg._start + 1, seg._end), frozen)
     local default_text = utf8.len(cand.text) == #tokens and cand.text or nil
     local spans = default_text and decoder_spans(cand, tokens)

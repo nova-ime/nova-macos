@@ -30,6 +30,13 @@
 // that are wrong with no orange on a wrong block go from 9.9% to 20.0%. A simulated user fixing
 // 541 sentences with the real keys presses 1134 -> 870 keys.
 //
+// The model is uer's GPT-2 trained further on Nova's text (README). Typed key by key over the 26
+// domains with repick on, it takes whole sentences right 77.9% -> 80.5%. A beam of 20 instead of 5
+// then gives 82.2% (150 sentences fixed, 43 broken of 6486), 88% instead of 80% of orange blocks
+// wrong, and the same per-key time (541 sentences, p99 4.4 ms). At 40 the prefix tree comes close to
+// its 2048 nodes; a full tree starts its prefixes over, and if they still do not fit, that key is
+// not scored.
+//
 // A key that leaves the input as it was (a pick, or Up/Down) makes nova_sentences decode what
 // follows the picked word again, and that can lose a word that was right (范围|跟 -> 范伟|根 with
 // a user dictionary). The sentence of the last key, with the chosen blocks written in, joins the
@@ -59,12 +66,26 @@
 // Schema options (all under nova_lm/): enabled, model (GGUF, relative to the user or shared data
 // directory), charmap (`code \t chars` per line), rare (`rare_share \t x` first, then
 // `code \t character \t share` per reading, see score()), reading_weight, tau, sentences, beam,
-// threads, context, drop_orange_context, repick, repick_tau, debug.
+// threads, context, drop_orange_context, repick, repick_tau, entity, entity_threshold, debug.
 // With debug on, property nova_lm holds the time this filter took and every block's share, and
 // a test can set property nova_lm_history to replace the committed text ("-" for none); the
 // environment then overrides the schema: NOVA_REPICK=<repick_tau> turns repick on,
 // NOVA_REPICK_FROZEN=1 lets it change frozen blocks too, NOVA_READING=<reading_weight>, and
-// NOVA_DE_MARGIN=<toward 地/得>[,<toward 的>] (negative leaves 的/地/得 alone).
+// NOVA_DE_MARGIN=<toward 地/得>[,<toward 的>] (negative leaves 的/地/得 alone), NOVA_ENTITY=<entity_threshold>
+// turns entity on (NOVA_ENT_DUMP=<file> appends the head's probabilities per final first choice).
+//
+// Entity (off by default; needs a model with the entity head, else it stays off): person and place names as one
+// block. A small head in the GGUF (nova.ent.*, f32) tags every character of the final first choice O/B-PER/I-PER/
+// B-LOC/I-LOC from the residual stream after nova.ent.layer blocks, LayerNorm without parameters, of the character
+// and the next two (see TreeLM::ent_probs). A name is 2..6 characters whose tags are B then I of one kind and whose
+// least probability is >= entity_threshold. After repick and before the orange marks, the blocks it crosses are cut
+// at its ends on syllable boundaries and the blocks inside are joined (text unchanged, mark '&'; debug line
+// ents=<joined>/<cut>, <cut> always 0 now). A name inside one block is not cut out of it: in eval0-3 that broke as many
+// right words (中美洲, 惠灵顿, 拉脱维亚) as it fixed. A name is left alone when it touches a chosen, focused, aux, abbreviated
+// or typo block, or a boundary nova_sentences took from nova_bounds, or when joining would stop a frozen block from
+// being frozen on the next key (it takes the largest age and share of the pieces, at least age 2 over frozen ones),
+// or would freeze text of the last decoder word, which nova_sentences keeps open while it may still change.
+// The head needs the state of the whole first choice, so its last character is run through the model once per key.
 // Creating nova_lm/debug.on in the user data directory turns on nova_lm/debug.log (see log_line).
 
 #include <rime/candidate.h>
@@ -81,7 +102,9 @@
 #include <rime/translation.h>
 #include <rime_api.h>
 
+#ifndef _WIN32
 #include <dlfcn.h>
+#endif
 #include <sys/stat.h>
 
 #include <cmath>
@@ -93,7 +116,9 @@
 #include <atomic>
 #include <chrono>
 #include <fstream>
+#include <functional>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
@@ -192,6 +217,23 @@ static vector<string> codes_of(const string &key) {
   return out;
 }
 
+// Length in bytes of every syllable of a block key (two letters, its aux letters or the wildcard), or nothing if
+// the key does not parse. codes_of() cuts the same way.
+static vector<size_t> syllable_lens(const string &key) {
+  vector<size_t> out;
+  for (size_t i = 0; i < key.size();) {
+    if (i + 1 >= key.size() || !islower(key[i])) return {};
+    size_t n = 2;
+    if (key[i + 1] != kWildcard) {
+      if (!islower(key[i + 1])) return {};
+      for (; n < 4 && i + n < key.size() && isupper(key[i + n]); n++) {}
+    }
+    out.push_back(n);
+    i += n;
+  }
+  return out;
+}
+
 // Model shared by all sessions --------------------------------------------
 
 struct Model {
@@ -254,7 +296,11 @@ static void log_line(const string &line) {
 }
 
 static string resolve(const string &file) {
+#ifdef _WIN32
+  if (file.empty() || rime::path(file).is_absolute()) return file;
+#else
   if (file.empty() || file[0] == '/') return file;
+#endif
   auto &deployer = rime::Service::instance().deployer();
   for (const auto &dir : {deployer.user_data_dir, deployer.shared_data_dir}) {
     auto p = dir / file;
@@ -265,14 +311,23 @@ static string resolve(const string &file) {
 
 // The packaged app keeps the ggml CPU backends in a nova-lm folder next to this plugin.
 static string backend_dir() {
+#ifdef _WIN32
+  return "";  // ggml and its CPU backend are linked into the plugin, nothing to load
+#else
   Dl_info info;
   if (!dladdr((const void *)&backend_dir, &info) || !info.dli_fname) return "";
   string self = info.dli_fname;
   return self.substr(0, self.rfind('/') + 1) + "nova-lm";
+#endif
 }
 
+// `nova_lm/entity` of the filter built last (every deploy builds them again), before the model loads: the entity head
+// costs time on every key, so a model loaded without the wish does not compute it. See model() for switching it.
+static std::atomic<bool> g_want_ent{false};
+static bool g_loaded_ent = false;  // the wish g_loaded_from was loaded with
+
 static std::shared_ptr<Model> load_model(const string &model_path, const string &charmap_path, const string &rare_path,
-                                         int threads, int cap) {
+                                         int threads, int cap, bool want_ent) {
   auto m = std::make_shared<Model>();
   std::ifstream rare_in(rare_path);
   string line;
@@ -292,7 +347,7 @@ static std::shared_ptr<Model> load_model(const string &model_path, const string 
     m->reading[f[0] + f[1]] = (float)std::log(share);
     if (share < rare_share) m->rare[f[0]] += decode(f[1]);
   }
-  if (!m->lm.load(model_path, threads, cap, backend_dir())) return nullptr;
+  if (!m->lm.load(model_path, threads, cap, backend_dir(), want_ent)) return nullptr;
   const auto &toks = m->lm.tokens();
   for (int i = 0; i < (int)toks.size(); i++) {
     u32string t = decode(toks[i]);
@@ -314,22 +369,28 @@ static std::shared_ptr<Model> load_model(const string &model_path, const string 
 }
 
 // Load in the background the first time; the filter passes everything through until it is ready.
+// After `nova_lm/entity` is switched and redeployed, the model is loaded again in the background, with or without the
+// entity head; the old one serves until then.
 static std::shared_ptr<Model> model(const string &model_path, const string &charmap_path, const string &rare_path,
                                     int threads) {
   std::lock_guard<std::mutex> lock(g_mutex);
-  if (g_model || g_loading || model_path.empty() || charmap_path.empty() || g_loaded_from == model_path) return g_model;
+  const bool want_ent = g_want_ent.load();
+  if (g_loading || model_path.empty() || charmap_path.empty()) return g_model;
+  // one attempt per path and wish, so a broken file is not reloaded on every key
+  if (g_loaded_from == model_path ? g_loaded_ent == want_ent : g_model != nullptr) return g_model;
   g_loading = true;
-  g_loaded_from = model_path;  // one attempt per path, so a broken file is not reloaded on every key
+  g_loaded_from = model_path;
+  g_loaded_ent = want_ent;
   std::thread([=] {
     auto t0 = std::chrono::steady_clock::now();
-    auto m = load_model(model_path, charmap_path, rare_path, threads, 2048);
+    auto m = load_model(model_path, charmap_path, rare_path, threads, 2048, want_ent);
     double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     log_line(string(m ? "load ok " : "load FAILED ") + model_path + " " + std::to_string((int)ms) + "ms");
     std::lock_guard<std::mutex> lock(g_mutex);
-    g_model = m;
+    if (m || !g_model) g_model = m;  // a failed reload keeps the model that works
     g_loading = false;
   }).detach();
-  return nullptr;
+  return g_model;
 }
 
 // Filter ---------------------------------------------------------------------
@@ -353,6 +414,8 @@ class NovaLmFilter : public rime::Filter {
       config->GetBool("nova_lm/repick", &repick_);
       config->GetDouble("nova_lm/repick_tau", &repick_tau_);
       config->GetDouble("nova_lm/reading_weight", &reading_w_);
+      config->GetBool("nova_lm/entity", &entity_);
+      config->GetDouble("nova_lm/entity_threshold", &entity_thr_);
     }
     if (debug_) {
       if (const char *e = getenv("NOVA_REPICK")) {
@@ -360,6 +423,10 @@ class NovaLmFilter : public rime::Filter {
         repick_tau_ = atof(e);
       }
       repick_frozen_ = getenv("NOVA_REPICK_FROZEN") != nullptr;
+      if (const char *e = getenv("NOVA_ENTITY")) {  // <threshold>: merge person and place names into one block
+        entity_ = true;
+        entity_thr_ = atof(e);
+      }
       if (const char *e = getenv("NOVA_READING")) reading_w_ = atof(e);
       if (const char *e = getenv("NOVA_DE_MARGIN")) {  // `to 地/得[,to 的]`; negative: leave 的/地/得 alone
         de_margin_ = (float)atof(e);
@@ -370,6 +437,7 @@ class NovaLmFilter : public rime::Filter {
     model_file_ = resolve(model_file_);
     charmap_file_ = resolve(charmap_file_);
     rare_file_ = resolve(rare_file_);
+    g_want_ent = entity_;
     model(model_file_, charmap_file_, rare_file_, threads_);
     if (ready()) announce(engine_->context());
     commit_ =engine_->context()->commit_notifier().connect([this](rime::Context *ctx) {
@@ -384,6 +452,7 @@ class NovaLmFilter : public rime::Filter {
       shown_top_.clear();
       shown_orange_.clear();
       last_ages_.clear();
+      last_marks_.clear();
       prev_top_.clear();
       last_top_.clear();
       prev_input_.clear();
@@ -504,6 +573,7 @@ class NovaLmFilter : public rime::Filter {
     bool frozen, swapped = false;  // frozen: s flag; swapped: re-picked on this key
     bool de = false;  // a 的/地/得 of the block is not the decoder's, see the header
     bool abbr = false;  // has an abbreviated syllable (second character kWildcard): not re-picked
+    char mark = 0;      // '&' merged by the entity head, '%' cut out of a larger block, see merge_entities
     float conf = 1.f;
     u32string alt;
   };
@@ -702,6 +772,166 @@ class NovaLmFilter : public rime::Filter {
     return true;
   }
 
+  // Names, see the header. `pr` holds the five tag probabilities of every character of `top` (O, B-PER, I-PER, B-LOC,
+  // I-LOC). Names are cut by the rule the head was trained with (retrain distill/ner_ltp.py spans): B starts one, I of the
+  // same type continues it, an I after anything else starts one, fewer than two characters is none; kept when the least
+  // probability of the chosen tags inside is at least entity_threshold; at most kEntityMax characters.
+  // A name touching a block the user chose, the focused block, one narrowed by aux letters, or one with an abbreviated
+  // syllable stays as it is. Blocks are cut only at syllable boundaries of a key that is the typed input (a key the input
+  // does not spell letter by letter cannot be cut). Only the blocks change, never a character.
+  // A block that nova_sentences would freeze on the next key (frozen_lines: not the last, two characters or more, share
+  // at least 50 or age at least 2, outside the last decoder word) must end in a block that it freezes too, else the name
+  // is left alone: one character would otherwise be decoded again, or merged with the last block, and the frozen text
+  // would change. The reverse holds too: characters of the last decoder word, which nova_sentences leaves open because
+  // the next syllables may still change the whole word, must not end in a block it freezes (a name that starts before
+  // that word and would be frozen whole is left alone). The merged block takes the larger age and share of its parts,
+  // at least the age a frozen block needs if any part was frozen. Marks: '&' two or more blocks made one; '%' (a name
+  // cut out of one block) is no longer made.
+  void merge_entities(Model &m, vector<Block> &blocks, const u32string &top, const vector<float> &pr, size_t typo_lines,
+                      const std::function<double(Block &)> &assess, int *merged, int *split_out) {
+    const size_t n = top.size();
+    if (pr.size() != 5 * n) return;
+    vector<int> tag(n);
+    vector<float> conf(n);
+    for (size_t k = 0; k < n; k++) {
+      int t = 0;
+      for (int j = 1; j < 5; j++)
+        if (pr[5 * k + j] > pr[5 * k + t]) t = j;
+      tag[k] = t;
+      conf[k] = pr[5 * k + t];
+    }
+    vector<std::pair<size_t, size_t>> names;
+    for (size_t i = 0; i < n;) {
+      if (!tag[i]) {
+        i++;
+        continue;
+      }
+      int kind = tag[i] <= 2 ? 1 : 3;
+      size_t j = i + 1;
+      while (j < n && tag[j] == kind + 1) j++;
+      float least = 1.f;
+      for (size_t k = i; k < j; k++) least = std::min(least, conf[k]);
+      if (j - i >= 2 && j - i <= kEntityMax && least >= entity_thr_) names.emplace_back(i, j);
+      i = j;
+    }
+    if (names.empty()) return;
+
+    // The last decoder word, as nova_sentences keeps it in nova_tree_groups: its blocks are not frozen.
+    long long open_from = -1;
+    if (typo_lines == 0) {
+      rime::Context *ctx = engine_->context();
+      string groups = ctx ? ctx->get_property("nova_tree_groups") : "";
+      string last_to = blocks.back().fields[2];
+      for (const auto &line : split(groups, '\n')) {
+        size_t colon = line.find(':');
+        if (colon != string::npos && line.substr(colon + 1) == last_to) open_from = atoll(line.c_str());
+      }
+    }
+    std::set<string> used_bounds;  // `byte offset:left code:right code` lines of nova_bounds_used: the offsets
+    if (rime::Context *ctx = engine_->context())
+      for (const auto &line : split(ctx->get_property("nova_bounds_used"), '\n')) {
+        size_t colon = line.find(':');
+        if (colon != string::npos) used_bounds.insert(line.substr(0, colon));
+      }
+    auto share_of = [](const Block &b) {
+      auto parts = split(b.fields[4], '\x1f');
+      return parts.size() > 1 ? atoi(parts[1].c_str()) : 0;
+    };
+    auto age_of = [](const Block &b) {
+      size_t at = b.fields[0].find('a');
+      return at == string::npos ? 0 : atoi(b.fields[0].c_str() + at + 1);
+    };
+    // Would nova_sentences freeze this block on the next key, were it block `i` of `list`?
+    auto freezes = [&](const vector<Block> &list, size_t i, bool by_value) {
+      const Block &b = list[i];
+      return i + 1 < list.size() + typo_lines && b.b - b.a >= 2 && !(open_from >= 0 && atoll(b.fields[1].c_str()) >= open_from) &&
+             (!by_value || share_of(b) >= 50 || age_of(b) >= 2);
+    };
+    // A block's piece [lo, hi) of its characters: block with the key, bytes and text of the piece.
+    auto piece = [&](const Block &src, size_t lo, size_t hi) {
+      vector<size_t> lens = syllable_lens(src.fields[3]);
+      size_t from = atol(src.fields[1].c_str()), off_lo = 0, off_hi = 0;
+      for (size_t k = 0; k < hi; k++) {
+        if (k < lo) off_lo += lens[k];
+        off_hi += lens[k];
+      }
+      Block nb = src;
+      nb.fields = {string("0") + (src.frozen ? "s" : "") + "a" + std::to_string(age_of(src)), std::to_string(from + off_lo),
+                   std::to_string(from + off_hi), src.fields[3].substr(off_lo, off_hi - off_lo), ""};
+      nb.a = src.a + lo;
+      nb.b = src.a + hi;
+      nb.fields[4] = encode(top.substr(nb.a, nb.b - nb.a)) + "\x1f" + std::to_string(share_of(src));
+      nb.alt.clear();
+      nb.mark = 0;
+      return nb;
+    };
+    auto cuttable = [&](const Block &b) {
+      vector<size_t> lens = syllable_lens(b.fields[3]);
+      return lens.size() == b.b - b.a && b.fields[3].size() == (size_t)(atol(b.fields[2].c_str()) - atol(b.fields[1].c_str()));
+    };
+
+    for (auto [x, y] : names) {
+      size_t p = blocks.size(), q = 0;
+      for (size_t i = 0; i < blocks.size(); i++)
+        if (blocks[i].a < y && blocks[i].b > x) {
+          if (p == blocks.size()) p = i;
+          q = i;
+        }
+      if (p == blocks.size()) continue;
+      if (p == q) continue;  // already one block, or inside one block: not cut out (see the header)
+      bool skip = false;
+      for (size_t i = p; i <= q; i++) skip = skip || blocks[i].chosen || blocks[i].focus || blocks[i].aux || blocks[i].abbr;
+      const bool cut_l = blocks[p].a < x, cut_r = blocks[q].b > y;
+      // A boundary nova_sentences took from nova_bounds (the user's [ ] choices) is forgotten at commit when no
+      // block edge is left there, so a name is not merged across one.
+      for (size_t i = p; i < q; i++) skip = skip || used_bounds.count(blocks[i].fields[2]);
+      if (skip || (cut_l && !cuttable(blocks[p])) || (cut_r && !cuttable(blocks[q]))) continue;
+      // frozen text must stay frozen
+      bool was_frozen = false;
+      for (size_t i = p; i <= q; i++) was_frozen = was_frozen || freezes(blocks, i, true);
+      vector<Block> made;  // what replaces blocks p..q
+      if (cut_l) made.push_back(piece(blocks[p], 0, x - blocks[p].a));
+      Block e = piece(blocks[p], x - blocks[p].a, p == q ? y - blocks[p].a : blocks[p].b - blocks[p].a);
+      bool all_frozen = blocks[p].frozen;
+      int age = age_of(blocks[p]), share = share_of(blocks[p]);
+      for (size_t i = p + 1; i <= q; i++) {
+        Block t = piece(blocks[i], 0, i == q ? y - blocks[i].a : blocks[i].b - blocks[i].a);
+        e.fields[2] = t.fields[2];
+        e.fields[3] += t.fields[3];
+        e.swapped = e.swapped || blocks[i].swapped;
+        e.de = e.de || blocks[i].de;
+        all_frozen = all_frozen && blocks[i].frozen;
+        age = std::max(age, age_of(blocks[i]));
+        share = std::max(share, share_of(blocks[i]));
+      }
+      e.b = y;
+      e.frozen = all_frozen;
+      if (was_frozen) age = std::max(age, 2);
+      e.fields[0] = string("0") + (all_frozen ? "s" : "") + "a" + std::to_string(age);
+      e.fields[4] = encode(top.substr(x, y - x)) + "\x1f" + std::to_string(share);
+      e.mark = q > p ? '&' : '%';
+      made.push_back(std::move(e));
+      if (cut_r) made.push_back(piece(blocks[q], y - blocks[q].a, blocks[q].b - blocks[q].a));
+      vector<Block> view(blocks.begin(), blocks.begin() + p);  // the blocks as they would be after the change
+      view.insert(view.end(), made.begin(), made.end());
+      view.insert(view.end(), blocks.begin() + q + 1, blocks.end());
+      bool ok = true;
+      for (size_t i = 0; i < made.size(); i++)
+        for (size_t j = p; j <= q; j++) {
+          if (blocks[j].a >= made[i].b || blocks[j].b <= made[i].a) continue;
+          if (freezes(blocks, j, true) && !freezes(view, p + i, false)) ok = false;
+          // text of the last decoder word stays open
+          if (open_from >= 0 && atoll(blocks[j].fields[1].c_str()) >= open_from && freezes(view, p + i, true)) ok = false;
+        }
+      if (!ok) continue;
+      for (auto &b : made) assess(b);
+      blocks.erase(blocks.begin() + p, blocks.begin() + q + 1);
+      blocks.insert(blocks.begin() + p, made.begin(), made.end());
+      (made.size() > 0 && made[cut_l ? 1 : 0].mark == '&' ? *merged : *split_out)++;
+    }
+  }
+  static constexpr size_t kEntityMax = 6;
+
   bool rewrite(Model &m, const string &tree, vector<u32string> sentences, string *out, string *info) {
     vector<Block> blocks;
     vector<string> keys;  // code of each syllable, plus the chosen character when the block is chosen
@@ -784,6 +1014,9 @@ class NovaLmFilter : public rime::Filter {
       m.lm.truncate((int)context_.size());  // tree full: keep the context, start the prefixes over
       reset_tree();
     }
+    // The entity head reads the first sentence whole, so its last node goes into this flush too. Without room in the
+    // tree the head is skipped on this key (see below); the orange marks and repicks go on.
+    if (entity_ && m.lm.has_ent() && !sentences.empty()) node(m, sentences.front());
     m.lm.flush();
 
     // Sentence scores: decoder sentences and full-length beam sentences, without duplicates.
@@ -832,9 +1065,9 @@ class NovaLmFilter : public rime::Filter {
         }
       }
     }
-    for (auto &blk : blocks) {
-      if (blk.chosen) continue;
-      if (blk.de) retext(blk, top.substr(blk.a, blk.b - blk.a));
+    // Share of the sentences that agree with the block's text, and the best other text (its alternative).
+    // Returns that other text's share.
+    auto assess = [&](Block &blk) {
       std::unordered_map<u32string, double> mass;
       std::unordered_map<u32string, std::pair<double, u32string>> shown;  // class -> (weight, text)
       for (const auto &[s, v] : scored) {
@@ -848,6 +1081,7 @@ class NovaLmFilter : public rime::Filter {
       u32string cur = top.substr(blk.a, blk.b - blk.a), mine = norm(cur);
       blk.conf = (float)mass[mine];
       double alt_mass = 0;
+      blk.alt.clear();
       for (const auto &[cls, w] : mass)
         if (cls != mine && w > alt_mass) {
           alt_mass = w;
@@ -860,6 +1094,13 @@ class NovaLmFilter : public rime::Filter {
         for (size_t k = 0; k < cur.size(); k++)
           if (blk.alt[k] != cur[k] && norm(u32string(1, blk.alt[k])) == norm(u32string(1, cur[k])))
             blk.alt[k] = cur[k];
+      return alt_mass;
+    };
+    for (auto &blk : blocks) {
+      if (blk.chosen) continue;
+      if (blk.de) retext(blk, top.substr(blk.a, blk.b - blk.a));
+      double alt_mass = assess(blk);
+      u32string cur = top.substr(blk.a, blk.b - blk.a);
       if (repick_ && !blk.aux && !blk.abbr && !blk.focus && (!blk.frozen || repick_frozen_) && blk.alt.size() == cur.size() &&
           blk.conf < repick_tau_ && alt_mass > blk.conf) {
         top.replace(blk.a, cur.size(), blk.alt);
@@ -870,6 +1111,45 @@ class NovaLmFilter : public rime::Filter {
         swaps_++;
       }
     }
+
+    // Person and place names, see the header: the entity head tags the final first sentence, and a name that
+    // two or more blocks share is made one block.
+    int ent_merged = 0, ent_split = 0;
+    const bool entity_on = entity_ && m.lm.has_ent();
+    double ent_flush_ms = 0;
+    auto ent_t0 = std::chrono::steady_clock::now();
+    if (entity_on && blocks.size() > 1) {
+      vector<int> chain;
+      vector<float> pr;
+      bool ok = true;
+      for (size_t k = 1; ok && k <= top.size(); k++) {
+        int id = node(m, top.substr(0, k));
+        if (id < 0) ok = false;
+        else chain.push_back(id);
+      }
+      if (ok) m.lm.flush();
+      ent_flush_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ent_t0).count();
+      ok = ok && m.lm.ent_probs(chain, &pr);
+      if (ok) {
+        if (const char *dump_path = debug_ ? getenv("NOVA_ENT_DUMP") : nullptr) {
+          if (FILE *dump = fopen(dump_path, "a")) {
+            size_t from = history_.size() > (size_t)context_chars_ ? history_.size() - context_chars_ : 0;
+            fprintf(dump, "%s\t%s\t", encode(history_.substr(from)).c_str(), encode(top).c_str());
+            for (size_t i = 0; i < pr.size(); i++) fprintf(dump, i ? " %.6f" : "%.6f", pr[i]);
+            fprintf(dump, "\n");
+            fclose(dump);
+          }
+        }
+        merge_entities(m, blocks, top, pr, typo_lines.size(), assess, &ent_merged, &ent_split);
+      }
+    }
+    const double ent_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ent_t0).count();
+    if (entity_on)  // a block merged on an earlier key keeps its mark while it stays the same block
+      for (auto &blk : blocks)
+        if (!blk.mark) {
+          auto it = last_marks_.find(blk.fields[1] + ":" + blk.fields[2] + ":" + encode(top.substr(blk.a, blk.b - blk.a)));
+          if (it != last_marks_.end()) blk.mark = it->second;
+        }
 
     // Orange blocks get the GPT-2 alternative first. Overview alternatives share nine number
     // keys, two per block: orange blocks first (least sure first), then purple ones as before.
@@ -921,6 +1201,7 @@ class NovaLmFilter : public rime::Filter {
       labels += (int)alts.size();
       if (!alts.empty()) kept += 'o';
       if (orange(blk)) kept += 'u';
+      if (blk.mark) kept += blk.mark;
       flags = kept + tail;
       blk.fields.resize(5);
       blk.fields.insert(blk.fields.end(), alts.begin(), alts.end());
@@ -932,12 +1213,13 @@ class NovaLmFilter : public rime::Filter {
       for (size_t k = 0; k < blocks[i].fields.size(); k++) os << (k ? "\t" : "") << blocks[i].fields[k];
       // per block: text=share% ('!' orange, '*' chosen by the user, '^' re-picked, '~' 的/地/得 changed), then /alternative
       dbg << ' ' << encode(top.substr(blocks[i].a, blocks[i].b - blocks[i].a)) << (blocks[i].chosen ? "*" : orange(blocks[i]) ? "!" : "")
-          << (blocks[i].swapped ? "^" : "") << (blocks[i].de ? "~" : "") << '=' << (int)(100 * blocks[i].conf);
+          << (blocks[i].swapped ? "^" : "") << (blocks[i].de ? "~" : "") << (blocks[i].mark ? string(1, blocks[i].mark) : "") << '=' << (int)(100 * blocks[i].conf);
       if (!blocks[i].alt.empty()) dbg << '/' << encode(blocks[i].alt);
     }
     dbg << " flags=";  // what the panel gets, block by block
     for (size_t i = 0; i < blocks.size(); i++) dbg << (i ? "," : "") << blocks[i].fields[0];
     dbg << " swaps=" << swaps_ << " tau=" << (int)(1000 * tau_) << "e-3 from=" << beam_from_ << "/" << keys.size() << " nodes=" << m.lm.size() << " sentences=" << scored.size();
+    if (entity_on) dbg << " ents=" << ent_merged << "/" << ent_split << " ent_ms=" << ent_flush_ms << "+" << ent_ms - ent_flush_ms;
     for (auto &line : typo_lines) {
       rerank_typo(m, line);
       os << '\n' << line;
@@ -951,6 +1233,9 @@ class NovaLmFilter : public rime::Filter {
       last_ages_[blk.fields[1] + ":" + blk.fields[2] + ":" + split(blk.fields[4], '\x1f')[0]] = at == string::npos ? 0 : atoi(flags.c_str() + at + 1);
     }
     last_syllables_ = keys.size();
+    last_marks_.clear();
+    for (const auto &blk : blocks)
+      if (blk.mark) last_marks_[blk.fields[1] + ":" + blk.fields[2] + ":" + encode(top.substr(blk.a, blk.b - blk.a))] = blk.mark;
     shown_top_ = top;
     prev_top_ = top;
     retexted_ = top != given;
@@ -966,6 +1251,9 @@ class NovaLmFilter : public rime::Filter {
   bool drop_orange_ = true;  // nova_lm/drop_orange_context
   bool repick_ = false, repick_frozen_ = false;
   double repick_tau_ = 0.2;
+  bool entity_ = false;  // nova_lm/entity: merge person and place names, needs a model with the entity head
+  double entity_thr_ = 0.8;  // nova_lm/entity_threshold: least probability of any character's tag inside a name
+  std::unordered_map<string, char> last_marks_;  // `from:to:text` of the blocks marked '&' or '%' on the last key
   double reading_w_ = 0;  // weight of ln P(code | character), see score()
   bool announced_ = false;  // nova_lm_ready is set, see announce()
   int swaps_ = 0;  // blocks re-picked on the last key

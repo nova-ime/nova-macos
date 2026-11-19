@@ -12,13 +12,15 @@
 -- 选词时只冻结前面的块，所选范围和它后面的部分重新解码，后面的字可以跟新选的字组词
 -- （显 + 时期 → 显示器）；用户选过的块不管在哪都保留。选的词覆盖整个输入时直接上屏。
 -- 空格不管光标在哪都上屏整句；末尾有半个音节时上屏前面的完整部分，见 commit_before_pending。
--- ; 等于数字 1。有焦点时 [ / ] 伸缩焦点块：[ 让出最后一个音节给右边的块，] 让出第一个音节给左边的块，
--- 让出的音节和那个相邻块一起单独解码，见 shrink。没有焦点时 [ ] 照常是标点。
+-- ; 等于数字 1。有焦点时 [ / ] 伸缩焦点块：[ 让出最后一个音节给右边的块，让出的音节和右边那块一起单独解码，见 shrink；
+-- ] 往右扩一个音节，把右边那块的第一个音节并进来，文字不重新解码，见 expand。没有焦点时 [ ] 照常是标点。
 -- Shift+Delete 或 Control+Delete（Control+K 经 key_binder 变成前者）：把焦点块的词从用户词库里删掉，
 -- 没有焦点时删最后一块，见 delete_word。
 -- 用 [ ] 定过的边界上屏时记下来，下次同一串编码直接按它切，见 learn_bounds。
+-- ] 并出来的词上屏时先记一次（nova_words.txt，不影响排序），第二次才写进用户词库，见 learn_words。
 
 local bounds = require("nova_bounds")
+local words = require("nova_words")
 
 -- 全拼简拼的音节是「声母键 + 通配符」两个字符（nVhV），见 nova.schema.yaml 的 abbrev 规则和 nova_quanpin。
 local WILDCARD = "V"
@@ -42,6 +44,7 @@ local function clear(ctx)
     ctx:set_property("nova_cycle", "")
     ctx:set_property("nova_redecode", "")
     ctx:set_property("nova_resized", "")
+    ctx:set_property("nova_merged", "")
     ctx:set_property("nova_bounds_used", "")
     -- 不清的话，下次打出同一串错的编码，没按空格就去算多打、漏打的改法，第一次空格也直接上屏。
     ctx:set_property("nova_fix_full", "")
@@ -104,8 +107,9 @@ local function shift_properties(ctx, at, removed, inserted, aux)
     end
     ctx:set_property("nova_tree", table.concat(lines, "\n"))
     ctx:set_property("nova_tree_input", "")
-    -- 中间的字母改了，伸缩时定的边界不再作数。
+    -- 中间的字母改了，伸缩时定的边界不再作数，并出来的块也不再作数。
     ctx:set_property("nova_resized", "")
+    ctx:set_property("nova_merged", "")
 end
 
 -- 在光标处插入 text，或删去光标前（before=true）/后的一个字母。只处理光标不在末尾的情形。
@@ -135,7 +139,7 @@ local function replace_input(ctx, at, removed, text, aux)
     ctx.input = input:sub(1, at) .. text .. input:sub(at + removed + 1)
 end
 
-local learn_bounds  -- 定义在 parse_tree 后面
+local learn_bounds, learn_words  -- 定义在 parse_tree 后面
 
 local function init(env)
     local ctx = env.engine.context
@@ -145,6 +149,8 @@ local function init(env)
     env.memory = ok and memory or nil
     env.commit = ctx.commit_notifier:connect(function(c)
         local learned, err = pcall(learn_bounds, c, c:get_commit_text())
+        if not learned then log.error("nova_tree_keys: " .. tostring(err)) end
+        learned, err = pcall(learn_words, env, c, c:get_commit_text())
         if not learned then log.error("nova_tree_keys: " .. tostring(err)) end
         clear(c)
     end)
@@ -167,7 +173,8 @@ local function parse_tree(tree)
     for line in tree:gmatch("[^\n]+") do
         local fields = {}
         for value in line:gmatch("[^\t]+") do fields[#fields + 1] = value end
-        local block = { chosen = fields[1]:sub(1, 1) == "1", overview = fields[1]:find("o", 1, true) ~= nil,
+        local block = { chosen = fields[1]:sub(1, 1) == "1", typo = fields[1]:match("^[^a]*"):find("t", 1, true) ~= nil,
+                        overview = fields[1]:find("o", 1, true) ~= nil,
                         from = tonumber(fields[2]), to = tonumber(fields[3]),
                         text = before_separator(fields[5]), alts = {} }
         for i = 6, #fields do
@@ -227,6 +234,115 @@ function learn_bounds(ctx, text)
     end
 end
 
+-- ] 并出来的块（nova_merged，每行 `from:to`，坐标和块的 from/to 一样）。
+local function merged_ranges(ctx)
+    local list = {}
+    for from, to in (ctx:get_property("nova_merged") or ""):gmatch("(%d+):(%d+)\n") do
+        list[#list + 1] = { tonumber(from), tonumber(to) }
+    end
+    return list
+end
+
+local function set_merged(ctx, list)
+    local lines = {}
+    for _, range in ipairs(list) do lines[#lines + 1] = range[1] .. ":" .. range[2] .. "\n" end
+    ctx:set_property("nova_merged", table.concat(lines))
+end
+
+-- 去掉和 [from, to) 重叠的记录：这一带的块被改动了，旧记录以后不能碰巧又对上某个块。
+local function merged_without(ctx, from, to)
+    local list = {}
+    for _, range in ipairs(merged_ranges(ctx)) do
+        if not (range[1] < to and from < range[2]) then list[#list + 1] = range end
+    end
+    return list
+end
+
+-- 把词写进用户词库（moran）。键是 `音节;辅助码 音节;辅助码 `，辅助码得自己查：speller 的 derive 规则让
+-- 一个字的拼写里有 lqW、lqWD 这样的形式，所以先用 dict_lookup("lq" .. 大写字母) 看这个字在不在结果里，
+-- 定出辅助码的第一个字母，再用同样的办法定第二个。不用音节 id：不用验证 Code 能不能赋值，也不会碰到简拼表的音节。
+-- 查不到辅助码（字不在词典里、读音和打的不一样）就返回 nil。
+local function has_char(memory, spelling, char)
+    if not memory:dict_lookup(spelling, false, 0) then return false end
+    for entry in memory:iter_dict() do
+        if entry.text == char then return true end
+    end
+    return false
+end
+
+local function aux_of(memory, pair, char)
+    for a = 65, 90 do
+        local first = string.char(a)
+        if has_char(memory, pair .. first, char) then
+            for b = 65, 90 do
+                local second = string.char(b)
+                if has_char(memory, pair .. first .. second, char) then return (first .. second):lower() end
+            end
+        end
+    end
+    return nil
+end
+
+local function write_word(env, code, text)
+    local memory = env.memory
+    if not memory then return false end
+    local parts, i = {}, 0
+    for _, char in utf8.codes(text) do
+        i = i + 1
+        local pair = code:sub(2 * i - 1, 2 * i)
+        local aux = aux_of(memory, pair, utf8.char(char))
+        if not aux then return false end
+        parts[#parts + 1] = pair .. ";" .. aux .. " "
+    end
+    local entry = DictEntry()
+    entry.text = text
+    entry.custom_code = table.concat(parts)
+    -- 写不进去（用户词库没打开）时返回 false，nova_words.txt 里的次数留着。
+    if not memory:update_userdict(entry, 1, "") then return false end
+    -- 上屏时 librime 开了事务，写的东西在 LevelDB 的 WriteBatch 里，下一次上屏前查不到：写完马上提交，
+    -- 紧接着打下一句就能用上。
+    memory:finish_session()
+    return true
+end
+
+local PROMOTE_AT = 2  -- 同一个词并出来上屏几次，才写进用户词库
+
+-- 上屏时给 ] 并出来的词记次数，见 nova_words。和 learn_bounds 一样，上屏的文字和树对不上时什么都不记。
+-- 到 PROMOTE_AT 次就写进用户词库、从 nova_words.txt 删掉；写不进去则留着。
+function learn_words(env, ctx, text)
+    local merged = merged_ranges(ctx)
+    if #merged == 0 then return end
+    local seg = ctx.composition:back()
+    if not seg then return end
+    local parts, found = {}, {}
+    local blocks = parse_tree(ctx:get_property("nova_tree") or "")
+    for _, block in ipairs(blocks) do
+        parts[#parts + 1] = block.text
+        found[block.from .. ":" .. block.to] = block
+    end
+    local shown = table.concat(parts)
+    if shown == "" or text:sub(-#shown) ~= shown then return end
+    local input = ctx.input:sub(seg._start + 1, seg._end)
+    local done = {}
+    for _, range in ipairs(merged) do
+        local block = found[range[1] .. ":" .. range[2]]
+        if block and block.chosen and not block.typo then
+            local code = block_code(input, block)
+            local count = #code / 2
+            if count >= 2 and count <= 6 and utf8.len(block.text) == count and not done[code .. block.text] then
+                done[code .. block.text] = true
+                if words.bump(code, block.text) >= PROMOTE_AT then
+                    if write_word(env, code, block.text) then
+                        words.remove(code, block.text)
+                    else
+                        log.error("nova_tree_keys: 取不到辅助码，词没写进用户词库：" .. code .. " " .. block.text)
+                    end
+                end
+            end
+        end
+    end
+end
+
 -- 走 ctx:select 才会记进用户词库；菜单里找不到（被 max_homophones 截掉）时直接上屏。
 local function commit_alternative(env, seg, text)
     local ctx = env.engine.context
@@ -239,6 +355,8 @@ local function commit_alternative(env, seg, text)
     end
     -- 这条路不经过 commit_notifier，边界在这里学。
     learn_bounds(ctx, text)
+    local learned, err = pcall(learn_words, env, ctx, text)
+    if not learned then log.error("nova_tree_keys: " .. tostring(err)) end
     env.engine:commit_text(text)
     ctx:clear()
 end
@@ -404,10 +522,10 @@ local function cycle(env, seg, blocks, focus, step)
     ctx:refresh_non_confirmed_composition()
 end
 
--- [ / ]：焦点块让出最后一个/第一个音节，留下的字原样固定（和以词定字一样），光标留在这块上，
--- 可以接着按。让出的音节和右边/左边那块（用户没选过时）一起单独解码，词不越过新边界；
--- 其他块原样冻结。块只剩一个音节时不动。
-local function shrink(env, seg, blocks, focus, keep_front)
+-- [：焦点块让出最后一个音节，留下的字原样固定（和以词定字一样），光标留在这块上，
+-- 可以接着按。让出的音节和右边那块（用户没选过时）一起单独解码，词不越过新边界；
+-- 其他块原样冻结。块只剩一个音节时不动。] 走 expand。
+local function shrink(env, seg, blocks, focus)
     local ctx = env.engine.context
     local input = ctx.input:sub(seg._start + 1, seg._end)
     local block = blocks[focus]
@@ -416,19 +534,11 @@ local function shrink(env, seg, blocks, focus, keep_front)
         if range[1] >= block.from and range[2] <= block.to then inside[#inside + 1] = range end
     end
     if #inside < 2 then return end
-    local keep_from, keep_to, low, high, neighbor
-    if keep_front then
-        keep_from, keep_to = block.from, inside[#inside - 1][2]
-        neighbor = blocks[focus + 1]
-        low, high = keep_to, (neighbor and not neighbor.chosen) and neighbor.to or block.to
-    else
-        keep_from, keep_to = inside[2][1], block.to
-        neighbor = blocks[focus - 1]
-        low, high = (neighbor and not neighbor.chosen) and neighbor.from or block.from, keep_from
-    end
-    local kept = block_chars(input, block, keep_from, keep_to)
+    local keep_to, neighbor = inside[#inside - 1][2], blocks[focus + 1]
+    local low, high = keep_to, (neighbor and not neighbor.chosen) and neighbor.to or block.to
+    local kept = block_chars(input, block, block.from, keep_to)
     if not kept then return end
-    local pins = { pin_line(input, keep_from, keep_to, "h", kept) }
+    local pins = { pin_line(input, block.from, keep_to, "h", kept) }
     for i, other in ipairs(blocks) do
         if i ~= focus and (other.to <= low or other.from >= high) then
             pins[#pins + 1] = pin_line(input, other.from, other.to, other.chosen and "h" or "s", other.text)
@@ -436,18 +546,76 @@ local function shrink(env, seg, blocks, focus, keep_front)
     end
     ctx:set_property("nova_pins", table.concat(pins))
     ctx:set_property("nova_pins_end", tostring(#input))
-    ctx:set_property("nova_open_from", math.min(low, keep_from) .. ":" .. ctx.input)
+    ctx:set_property("nova_open_from", block.from .. ":" .. ctx.input)
     ctx:set_property("nova_redecode", low .. ":" .. high .. ":" .. ctx.input)
     ctx:set_property("nova_cycle", "")
     -- 这条边界是用户定的，上屏时学，见 learn_bounds。连着按是在挪同一条边界，旧位置作废。
-    local moved, edge = keep_front and block.to or block.from, keep_front and keep_to or keep_from
     local resized = {}
     for line, pos in (ctx:get_property("nova_resized") or ""):gmatch("((%d+):[^\n]*\n)") do
-        if tonumber(pos) ~= moved and tonumber(pos) ~= edge then resized[#resized + 1] = line end
+        if tonumber(pos) ~= block.to and tonumber(pos) ~= keep_to then resized[#resized + 1] = line end
     end
-    resized[#resized + 1] = edge .. ":" .. input:sub(1, edge + 2) .. "\n"
+    resized[#resized + 1] = keep_to .. ":" .. input:sub(1, keep_to + 2) .. "\n"
     ctx:set_property("nova_resized", table.concat(resized))
+    -- 在 ] 并出来的块上按 [：留下的部分至少还有两个音节才算词，记录跟着缩短。
+    local was_merged = false
+    for _, range in ipairs(merged_ranges(ctx)) do
+        if range[1] == block.from and range[2] == block.to then was_merged = true end
+    end
+    local merged = merged_without(ctx, block.from, high)
+    if was_merged and #inside - 1 >= 2 then merged[#merged + 1] = { block.from, keep_to } end
+    set_merged(ctx, merged)
     set_cursor(ctx, seg._start + keep_to, true)
+    ctx:refresh_non_confirmed_composition()
+end
+
+-- ]：焦点块往右扩一个音节，把右边那块的第一个音节并进来，合并两块就是在左边那块上按 ]。
+-- 新块的字是焦点块现在显示的字加上那个音节现在显示的字，不重新解码（人名一并就被换成别的词）；
+-- 右边那块剩下的部分仍是一块，字原样。其他块原样冻结，没有要重新解码的范围。光标留在新块末尾，可以接着按。
+-- 焦点是最后一块、右边是打错键的原样字母块、取不出那个音节的字时不动。
+local function expand(env, seg, blocks, focus)
+    local ctx = env.engine.context
+    local input = ctx.input:sub(seg._start + 1, seg._end)
+    local block, right = blocks[focus], blocks[focus + 1]
+    if not right or right.typo then return end
+    local first
+    for _, range in ipairs(syllable_ranges(input)) do
+        if range[1] >= right.from and range[2] <= right.to then first = range break end
+    end
+    if not first then return end
+    local taken = block_chars(input, right, first[1], first[2])
+    if not taken then return end
+    local rest
+    if first[2] < right.to then
+        rest = block_chars(input, right, first[2], right.to)
+        if not rest then return end
+    end
+    local pins = { pin_line(input, block.from, first[2], "h", block.text .. taken) }
+    if rest then pins[#pins + 1] = pin_line(input, first[2], right.to, right.chosen and "h" or "s", rest) end
+    for i, other in ipairs(blocks) do
+        if i ~= focus and i ~= focus + 1 then
+            pins[#pins + 1] = pin_line(input, other.from, other.to, other.chosen and "h" or "s", other.text)
+        end
+    end
+    ctx:set_property("nova_pins", table.concat(pins))
+    ctx:set_property("nova_pins_end", tostring(#input))
+    ctx:set_property("nova_open_from", "")
+    ctx:set_property("nova_redecode", "")
+    ctx:set_property("nova_cycle", "")
+    -- 边界是用户定的，上屏时学，见 learn_bounds。连着按是在挪同一条边界，旧位置（F 原来的末尾）作废。
+    -- 新块是最后一块时右边没有块，改记它的左边界，不然并好的块学不到。
+    local edge = first[2] < #input and first[2] or block.from
+    local resized = {}
+    for line, pos in (ctx:get_property("nova_resized") or ""):gmatch("((%d+):[^\n]*\n)") do
+        pos = tonumber(pos)
+        if pos ~= block.to and pos ~= first[2] and pos ~= edge then resized[#resized + 1] = line end
+    end
+    if edge > 0 then resized[#resized + 1] = edge .. ":" .. input:sub(1, edge + 2) .. "\n" end
+    ctx:set_property("nova_resized", table.concat(resized))
+    -- 新块是 ] 并出来的，上屏时记次数，见 learn_words。连按 ] 是同一块在变长，旧范围被去掉。
+    local merged = merged_without(ctx, block.from, right.to)
+    merged[#merged + 1] = { block.from, first[2] }
+    set_merged(ctx, merged)
+    set_cursor(ctx, seg._start + first[2], true)
     ctx:refresh_non_confirmed_composition()
 end
 
@@ -505,7 +673,10 @@ local function delete_word(env, seg, blocks, focus)
     local deleted = 0
     for from = math.max(1, last - MAX_WORD_SYLLABLES + 1), first do
         for to = last, math.min(#pairs, from + MAX_WORD_SYLLABLES - 1) do
-            deleted = deleted + forget(env, { table.unpack(pairs, from, to) }, table.concat(chars, "", from, to))
+            local text = table.concat(chars, "", from, to)
+            deleted = deleted + forget(env, { table.unpack(pairs, from, to) }, text)
+            -- 还没记满次数的（nova_words.txt）也一起删。
+            if to > from then words.remove(table.concat(pairs, "", from, to), text) end
         end
     end
     if deleted == 0 then return end
@@ -630,8 +801,8 @@ local function func(key, env)
     end
     local is_digit = (code >= 0x31 and code <= 0x39) or code == SEMICOLON
     local is_cycle = focused and (code == UP or code == DOWN)
-    local is_shrink = focused and (code == BRACKET_LEFT or code == BRACKET_RIGHT)
-    if not is_digit and not is_cycle and not is_shrink and code ~= LEFT and code ~= RIGHT and code ~= SPACE then return 2 end
+    local is_resize = focused and (code == BRACKET_LEFT or code == BRACKET_RIGHT)
+    if not is_digit and not is_cycle and not is_resize and code ~= LEFT and code ~= RIGHT and code ~= SPACE then return 2 end
     local tree = ctx:get_property("nova_tree") or ""
     if tree == "" then return (code == LEFT or code == RIGHT) and 1 or 2 end
     -- 用户翻页或移动高亮后，面板显示的是普通列表，按键归列表。
@@ -666,8 +837,10 @@ local function func(key, env)
         if focus then cycle(env, seg, blocks, focus, code == DOWN and 1 or -1) end
         return 1
     end
-    if is_shrink then
-        if focus then shrink(env, seg, blocks, focus, code == BRACKET_LEFT) end
+    if is_resize then
+        if focus then
+            if code == BRACKET_LEFT then shrink(env, seg, blocks, focus) else expand(env, seg, blocks, focus) end
+        end
         return 1
     end
     if is_digit then
