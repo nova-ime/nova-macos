@@ -254,6 +254,10 @@ struct Model {
     auto it = reading.find(key.substr(0, 2) + encode(u32string(1, c)));
     return it == reading.end() ? 0.f : it->second;
   }
+  // Word counts of nova_lexicon.txt (`#total \t n` first, then `word \t count`), the list nova_sentences.lua cuts long
+  // decoder words with. Here it re-cuts blocks whose text GPT-2 changed, see resegment(). Empty without the file.
+  std::unordered_map<u32string, uint32_t> lexicon;
+  double lexicon_log_total = 0;
   const void *owner = nullptr;  // filter whose tree is in the KV cache
 };
 
@@ -327,10 +331,25 @@ static std::atomic<bool> g_want_ent{false};
 static bool g_loaded_ent = false;  // the wish g_loaded_from was loaded with
 
 static std::shared_ptr<Model> load_model(const string &model_path, const string &charmap_path, const string &rare_path,
-                                         int threads, int cap, bool want_ent) {
+                                         const string &lexicon_path, int threads, int cap, bool want_ent) {
   auto m = std::make_shared<Model>();
-  std::ifstream rare_in(rare_path);
   string line;
+  if (!lexicon_path.empty()) {
+    std::ifstream lex_in(lexicon_path);
+    while (std::getline(lex_in, line)) {
+      size_t tab = line.find('\t');
+      if (tab == string::npos) continue;
+      if (line.compare(0, tab, "#total") == 0) {
+        double total = atof(line.c_str() + tab + 1);
+        if (total > 0) m->lexicon_log_total = std::log(total);
+        continue;
+      }
+      long count = atol(line.c_str() + tab + 1);
+      if (count > 0) m->lexicon.emplace(decode(line.substr(0, tab)), (uint32_t)count);
+    }
+    if (m->lexicon_log_total <= 0) m->lexicon.clear();
+  }
+  std::ifstream rare_in(rare_path);
   // First `rare_share \t x`: a reading with a share under x is rare; without that line none is.
   // Then `code \t character \t share` per reading. scripts/wanxiang/rare_readings.py writes both.
   double rare_share = 0;
@@ -347,7 +366,7 @@ static std::shared_ptr<Model> load_model(const string &model_path, const string 
     m->reading[f[0] + f[1]] = (float)std::log(share);
     if (share < rare_share) m->rare[f[0]] += decode(f[1]);
   }
-  if (!m->lm.load(model_path, threads, cap, backend_dir(), want_ent)) return nullptr;
+  if (!m->lm.load(model_path, threads, cap, backend_dir(), want_ent, true)) return nullptr;
   const auto &toks = m->lm.tokens();
   for (int i = 0; i < (int)toks.size(); i++) {
     u32string t = decode(toks[i]);
@@ -372,7 +391,7 @@ static std::shared_ptr<Model> load_model(const string &model_path, const string 
 // After `nova_lm/entity` is switched and redeployed, the model is loaded again in the background, with or without the
 // entity head; the old one serves until then.
 static std::shared_ptr<Model> model(const string &model_path, const string &charmap_path, const string &rare_path,
-                                    int threads) {
+                                    const string &lexicon_path, int threads) {
   std::lock_guard<std::mutex> lock(g_mutex);
   const bool want_ent = g_want_ent.load();
   if (g_loading || model_path.empty() || charmap_path.empty()) return g_model;
@@ -383,7 +402,7 @@ static std::shared_ptr<Model> model(const string &model_path, const string &char
   g_loaded_ent = want_ent;
   std::thread([=] {
     auto t0 = std::chrono::steady_clock::now();
-    auto m = load_model(model_path, charmap_path, rare_path, threads, 2048, want_ent);
+    auto m = load_model(model_path, charmap_path, rare_path, lexicon_path, threads, 2048, want_ent);
     double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     log_line(string(m ? "load ok " : "load FAILED ") + model_path + " " + std::to_string((int)ms) + "ms");
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -437,8 +456,9 @@ class NovaLmFilter : public rime::Filter {
     model_file_ = resolve(model_file_);
     charmap_file_ = resolve(charmap_file_);
     rare_file_ = resolve(rare_file_);
+    lexicon_file_ = resolve(lexicon_file_);
     g_want_ent = entity_;
-    model(model_file_, charmap_file_, rare_file_, threads_);
+    model(model_file_, charmap_file_, rare_file_, lexicon_file_, threads_);
     if (ready()) announce(engine_->context());
     commit_ =engine_->context()->commit_notifier().connect([this](rime::Context *ctx) {
       // Orange blocks committed unchanged stay out of the context: a wrong word there makes GPT-2
@@ -529,6 +549,7 @@ class NovaLmFilter : public rime::Filter {
     shown_top_.clear();
     shown_orange_.clear();
     swaps_ = 0;
+    resegments_ = 0;
     retexted_ = false;
     if (tree.size() > 1) {
       std::lock_guard<std::mutex> lock(g_mutex);
@@ -932,6 +953,177 @@ class NovaLmFilter : public rime::Filter {
   }
   static constexpr size_t kEntityMax = 6;
 
+  // A re-picked block keeps the edges of the decoder's words: for zjuibuuixm the decoder has 咱|时不时|先, GPT-2
+  // re-picks 暂, 时不实 and 现, and 时不实 is no word. Every run of adjacent re-picked blocks that holds such a block
+  // (two characters or more, not in nova_lexicon.txt) is cut again into lexicon words by count, as lexicon_split in
+  // nova_sentences.lua does: 暂时|不|实现. Blocks GPT-2 left alone keep their edges: the lexicon has no 王毅 or 过道里,
+  // which the decoder and the entity head put together. Only the blocks change, never a character. Runs stop at
+  // blocks the user chose, the focused block, blocks narrowed by aux letters, frozen ones, ones with an abbreviated
+  // syllable or a key the input does not spell letter by letter, and at boundaries from nova_bounds.
+  //
+  // With the segmentation head in the model file, its cuts replace the lexicon's: the head tags the final first
+  // sentence (a block starts at character k when its chance is 0.5 or more), and a run is cut again wherever a word
+  // of the head joins characters of two blocks. The head knows names and words outside the lexicon.
+  void resegment(Model &m, vector<Block> &blocks, const u32string &top, const std::function<double(Block &)> &assess) {
+    if (blocks.size() < 2) return;
+    vector<bool> head_cut;  // per character of top: a block starts here, by the segmentation head; empty = lexicon
+    if (m.lm.has_seg()) {
+      bool any_swapped = false;
+      for (const auto &b : blocks) any_swapped = any_swapped || b.swapped;
+      if (!any_swapped) return;
+      vector<int> chain;
+      vector<float> pr;
+      bool ok = true;
+      for (size_t k = 1; ok && k <= top.size(); k++) {
+        int id = node(m, top.substr(0, k));
+        if (id < 0) ok = false;
+        else chain.push_back(id);
+      }
+      if (ok) m.lm.flush();
+      if (ok && m.lm.seg_probs(chain, &pr)) {
+        head_cut.assign(top.size() + 1, true);
+        for (size_t k = 1; k < top.size(); k++) head_cut[k] = pr[2 * k + 1] >= 0.5f;
+      }
+    }
+    if (head_cut.empty() && m.lexicon.empty()) return;
+    auto known = [&](const u32string &w) { return m.lexicon.count(w) > 0; };
+    std::set<string> used_bounds;
+    if (rime::Context *ctx = engine_->context())
+      for (const auto &line : split(ctx->get_property("nova_bounds_used"), '\n')) {
+        size_t colon = line.find(':');
+        if (colon != string::npos) used_bounds.insert(line.substr(0, colon));
+      }
+    auto age_of = [](const Block &b) {
+      size_t at = b.fields[0].find('a');
+      return at == string::npos ? 0 : atoi(b.fields[0].c_str() + at + 1);
+    };
+    auto free_block = [&](const Block &b) {
+      vector<size_t> lens = syllable_lens(b.fields[3]);
+      return !b.chosen && !b.focus && !b.aux && !b.abbr && !b.frozen && !b.mark && lens.size() == b.b - b.a &&
+             b.fields[3].size() == (size_t)(atol(b.fields[2].c_str()) - atol(b.fields[1].c_str()));
+    };
+    auto broken = [&](const Block &b) {
+      return b.swapped && b.b - b.a >= 2 && !known(top.substr(b.a, b.b - b.a));
+    };
+    for (size_t p = 0; p < blocks.size(); p++) {
+      if (!free_block(blocks[p])) continue;
+      size_t q = p;
+      while (q + 1 < blocks.size() && free_block(blocks[q + 1]) && !used_bounds.count(blocks[q].fields[2]) &&
+             blocks[q].swapped && blocks[q + 1].swapped)
+        q++;
+      bool any = !head_cut.empty();  // the head: the word check below decides
+      for (size_t i = p; i <= q; i++) any = any || broken(blocks[i]);
+      if (!any) {
+        p = q;
+        continue;
+      }
+      const size_t x0 = blocks[p].a, n = blocks[q].b - x0;
+      vector<size_t> cuts;  // word ends, relative to x0
+      if (!head_cut.empty()) {
+        for (size_t j = 1; j <= n; j++)
+          if (j == n || head_cut[x0 + j]) cuts.push_back(j);
+      } else {
+        // Best cut of the run's text: sum of ln(count / total) per word; a single character not in the list counts 1.
+        vector<double> best(n + 1, -INFINITY);
+        vector<size_t> from(n + 1, 0);
+        best[0] = 0;
+        for (size_t i = 0; i < n; i++) {
+          if (best[i] == -INFINITY) continue;
+          for (size_t j = i + 1; j <= n && j - i <= kWordMax; j++) {
+            auto it = m.lexicon.find(top.substr(x0 + i, j - i));
+            double count = it != m.lexicon.end() ? it->second : (j - i == 1 ? 1 : 0);
+            if (count <= 0) continue;
+            double s = best[i] + std::log(count) - m.lexicon_log_total;
+            if (s > best[j]) {
+              best[j] = s;
+              from[j] = i;
+            }
+          }
+        }
+        for (size_t j = n; j > 0; j = from[j]) cuts.push_back(j);
+        std::reverse(cuts.begin(), cuts.end());
+      }
+      // Byte offset in the input and key of every character of the run.
+      vector<size_t> at{(size_t)atol(blocks[p].fields[1].c_str())};
+      vector<string> keys;
+      vector<int> ages;
+      vector<bool> swapped;
+      for (size_t i = p; i <= q; i++) {
+        size_t off = 0;
+        for (size_t len : syllable_lens(blocks[i].fields[3])) {
+          keys.push_back(blocks[i].fields[3].substr(off, len));
+          off += len;
+          at.push_back(at.back() + len);
+          ages.push_back(age_of(blocks[i]));
+          swapped.push_back(blocks[i].swapped);
+        }
+      }
+      // The new cut is taken only where a lexicon word joins characters of two blocks (暂+时, 实+现): the blocks such
+      // words touch take it, the others keep their edges. A block that is no word is not just split (所租, 林炎).
+      vector<bool> hit(q - p + 1, false);
+      auto block_of = [&](size_t rel) {
+        size_t i = p;
+        while (blocks[i].b <= x0 + rel) i++;
+        return i - p;
+      };
+      {
+        size_t lo = 0;
+        for (size_t hi : cuts) {
+          size_t first = block_of(lo), last = block_of(hi - 1);
+          if (first != last)
+            for (size_t i = first; i <= last; i++) hit[i] = true;
+          lo = hi;
+        }
+      }
+      if (std::find(hit.begin(), hit.end(), true) == hit.end()) {
+        p = q;
+        continue;
+      }
+      auto make = [&](size_t lo, size_t hi) {
+        Block nb = blocks[p];
+        nb.a = x0 + lo;
+        nb.b = x0 + hi;
+        string key;
+        int age = 0;
+        bool sw = false;
+        for (size_t k = lo; k < hi; k++) {
+          key += keys[k];
+          age = std::max(age, ages[k]);
+          sw = sw || swapped[k];
+        }
+        nb.fields = {"0a" + std::to_string(age), std::to_string(at[lo]), std::to_string(at[hi]), key,
+                     encode(top.substr(nb.a, nb.b - nb.a)) + "\x1f"};
+        nb.swapped = sw;
+        nb.de = false;
+        nb.alt.clear();
+        assess(nb);
+        return nb;
+      };
+      vector<Block> made;
+      for (size_t i = 0; i <= q - p; i++) {
+        if (!hit[i]) {
+          made.push_back(blocks[p + i]);
+          continue;
+        }
+        size_t k = i;
+        while (k + 1 <= q - p && hit[k + 1]) k++;
+        size_t lo = blocks[p + i].a - x0, gh = blocks[p + k].b - x0;
+        for (size_t hi : cuts)
+          if (hi > lo && hi <= gh) {
+            made.push_back(make(lo, hi));
+            lo = hi;
+          }
+        i = k;
+      }
+      const size_t count = made.size();
+      blocks.erase(blocks.begin() + p, blocks.begin() + q + 1);
+      blocks.insert(blocks.begin() + p, std::make_move_iterator(made.begin()), std::make_move_iterator(made.end()));
+      resegments_++;
+      p += count - 1;
+    }
+  }
+  static constexpr size_t kWordMax = 8;
+
   bool rewrite(Model &m, const string &tree, vector<u32string> sentences, string *out, string *info) {
     vector<Block> blocks;
     vector<string> keys;  // code of each syllable, plus the chosen character when the block is chosen
@@ -1111,6 +1303,7 @@ class NovaLmFilter : public rime::Filter {
         swaps_++;
       }
     }
+    if (repick_) resegment(m, blocks, top, assess);
 
     // Person and place names, see the header: the entity head tags the final first sentence, and a name that
     // two or more blocks share is made one block.
@@ -1218,7 +1411,7 @@ class NovaLmFilter : public rime::Filter {
     }
     dbg << " flags=";  // what the panel gets, block by block
     for (size_t i = 0; i < blocks.size(); i++) dbg << (i ? "," : "") << blocks[i].fields[0];
-    dbg << " swaps=" << swaps_ << " tau=" << (int)(1000 * tau_) << "e-3 from=" << beam_from_ << "/" << keys.size() << " nodes=" << m.lm.size() << " sentences=" << scored.size();
+    dbg << " swaps=" << swaps_ << " recut=" << resegments_ << " tau=" << (int)(1000 * tau_) << "e-3 from=" << beam_from_ << "/" << keys.size() << " nodes=" << m.lm.size() << " sentences=" << scored.size();
     if (entity_on) dbg << " ents=" << ent_merged << "/" << ent_split << " ent_ms=" << ent_flush_ms << "+" << ent_ms - ent_flush_ms;
     for (auto &line : typo_lines) {
       rerank_typo(m, line);
@@ -1246,6 +1439,7 @@ class NovaLmFilter : public rime::Filter {
 
   bool enabled_ = false, debug_ = false;
   string model_file_ = "nova_lm/gpt2.gguf", charmap_file_ = "nova_lm/charmap.tsv", rare_file_ = "nova_rare.txt";
+  string lexicon_file_ = "nova_lexicon.txt";  // same file nova_sentences.lua reads
   double tau_ = 0.075;
   int sentences_ = 5, beam_ = 5, threads_ = 4, context_chars_ = 30;
   bool drop_orange_ = true;  // nova_lm/drop_orange_context
@@ -1257,6 +1451,7 @@ class NovaLmFilter : public rime::Filter {
   double reading_w_ = 0;  // weight of ln P(code | character), see score()
   bool announced_ = false;  // nova_lm_ready is set, see announce()
   int swaps_ = 0;  // blocks re-picked on the last key
+  int resegments_ = 0;  // runs of blocks cut again on the last key, see resegment()
   // Blocks of the last key (`from:to:text`) and how many syllables each has kept its text.
   std::unordered_map<string, int> last_ages_;
   size_t last_syllables_ = 0;

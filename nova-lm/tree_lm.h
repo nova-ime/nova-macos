@@ -23,6 +23,12 @@
 
 namespace nova_lm {
 
+struct Head {
+  ggml_tensor *fc1 = nullptr, *fb1 = nullptr, *fc2 = nullptr, *fb2 = nullptr;
+  int layer = 0, h = 0, nout = 0;
+  bool ok = false;
+};
+
 class TreeLM {
  public:
   ~TreeLM() {
@@ -37,7 +43,8 @@ class TreeLM {
   // cap = number of KV cells (tree nodes, context included) kept at once.
   // backend_dir: where the ggml CPU backend libraries are (libggml-cpu-*.so); empty means
   // ggml's built-in search path.
-  bool load(const std::string &path, int threads, int cap, const std::string &backend_dir = "", bool want_ent = false) {
+  bool load(const std::string &path, int threads, int cap, const std::string &backend_dir = "", bool want_ent = false,
+            bool want_seg = false) {
     // The CPU backend runs on libomp, whose workers busy-wait 200 ms after each parallel region by default.
     // In an input method that burns several cores after every key. 0 is slower (a graph wakes
     // the workers many times); 5 ms keeps them warm within one key: 400 typed sentences give
@@ -89,16 +96,22 @@ class TreeLM {
     int64_t tk = gguf_find_key(g, "tokenizer.ggml.tokens");
     if (!L_ || !D_ || !NH_ || tk < 0) { gguf_free(g); ggml_free(meta); return false; }
     for (size_t i = 0, n = gguf_get_arr_n(g, tk); i < n; i++) tokens_.push_back(gguf_get_arr_str(g, tk, i));
-    // Entity head (nova.ent.*, see ent_probs); a file without it, or with one this code does not know, just has no head.
-    bool ent_meta = false;
+    // Entity head (nova.ent.*) and segmentation head (nova.seg.*), see probs(); a file without one, or with one this
+    // code does not know, just has no such head.
+    bool ent_meta = false, seg_meta = false;
     {
       int64_t et = gguf_find_key(g, "nova.ent.tags");
       static const char *kTags[] = {"O", "B-PER", "I-PER", "B-LOC", "I-LOC"};
       ent_meta = et >= 0 && gguf_get_arr_n(g, et) == 5;
       for (int i = 0; ent_meta && i < 5; i++) ent_meta = !strcmp(gguf_get_arr_str(g, et, i), kTags[i]);
-      ent_layer_ = u32("nova.ent.layer");
-      ent_h_ = u32("nova.ent.hidden");
+      ent_.layer = u32("nova.ent.layer");
+      ent_.h = u32("nova.ent.hidden");
+      ent_.nout = 5;
       ent_meta = ent_meta && u32("nova.ent.window") == 3;
+      seg_.layer = u32("nova.seg.layer");
+      seg_.h = u32("nova.seg.hidden");
+      seg_.nout = 2;
+      seg_meta = u32("nova.seg.window") == 3;
     }
 
     int64_t nt = gguf_get_n_tensors(g);
@@ -148,11 +161,11 @@ class TreeLM {
     if (!wte_ || !wpe_ || !out_) return false;
     V_ = (int)wte_->ne[1];
     npos_ = (int)wpe_->ne[1];
-    fc1_ = W("ent.fc1.w"); fb1_ = W("ent.fc1.bias"); fc2_ = W("ent.fc2.w"); fb2_ = W("ent.fc2.bias");
-    ent_ok_ = want_ent && ent_meta && fc1_ && fb1_ && fc2_ && fb2_ && ent_layer_ >= 1 && ent_layer_ < L_ && ent_h_ > 0 &&
-              fc1_->type == GGML_TYPE_F32 && fc2_->type == GGML_TYPE_F32 && fb1_->type == GGML_TYPE_F32 &&
-              fb2_->type == GGML_TYPE_F32 && fc1_->ne[0] == 3 * D_ + 2 && fc1_->ne[1] == ent_h_ &&
-              fc2_->ne[0] == ent_h_ && fc2_->ne[1] == 5 && fb1_->ne[0] == ent_h_ && fb2_->ne[0] == 5;
+    ent_.ok = want_ent && ent_meta && bind(ent_, "ent");
+    seg_.ok = want_seg && seg_meta && bind(seg_, "seg");
+    // Both heads read the same node vector e: with the two at different layers, the segmentation head goes.
+    if (ent_.ok && seg_.ok && seg_.layer != ent_.layer) seg_.ok = false;
+    e_layer_ = ent_.ok ? ent_.layer : seg_.ok ? seg_.layer : 0;
 
     cap_ = cap;
     ggml_init_params kp{ggml_tensor_overhead() * (2 * L_ + 1), nullptr, true};
@@ -170,55 +183,62 @@ class TreeLM {
   }
 
   const std::vector<std::string> &tokens() const { return tokens_; }
-  bool has_ent() const { return ent_ok_; }
+  bool has_ent() const { return ent_.ok; }
+  bool has_seg() const { return seg_.ok; }
+  bool ent_probs(const std::vector<int> &chain, std::vector<float> *out) { return probs(ent_, 0, chain, out); }
+  // Segmentation head: out[2 * k + 1] is the chance that a block starts at character k (trained for k >= 1).
+  bool seg_probs(const std::vector<int> &chain, std::vector<float> *out) { return probs(seg_, 1, chain, out); }
 
-  // Entity head. Per character k of a sentence (chain[k] = flushed node whose token is character k, so the
+  // A head (entity or segmentation). Per character k of a sentence (chain[k] = flushed node whose token is character k, so the
   // chain is the sentence's own prefixes): the residual stream after `nova.ent.layer` blocks, LayerNorm without
   // parameters, e_k; input [e_k, e_k+1, e_k+2, has k+1, has k+2] with a missing state 0; Linear -> GELU -> Linear;
-  // softmax over O, B-PER, I-PER, B-LOC, I-LOC. out[5 * k + t]. The first Linear splits by input block, so each
-  // node keeps W_j e (3 x hidden) the first time it is read and a character costs three additions.
-  bool ent_probs(const std::vector<int> &chain, std::vector<float> *out) {
-    if (!ent_ok_) return false;
-    const int n = (int)chain.size(), H = ent_h_, ld = 3 * D_ + 2;
-    const float *W1 = (const float *)fc1_->data, *b1 = (const float *)fb1_->data;
-    const float *W2 = (const float *)fc2_->data, *b2 = (const float *)fb2_->data;
+  // softmax over the head's labels (entity: O, B-PER, I-PER, B-LOC, I-LOC; segmentation: no cut, cut). out[nout * k + t].
+  // The first Linear splits by input block, so each node keeps W_j e (3 x hidden) the first time a head reads it
+  // (proj[slot]) and a character costs three additions.
+  bool probs(const Head &hd, int slot, const std::vector<int> &chain, std::vector<float> *out) {
+    if (!hd.ok) return false;
+    const int n = (int)chain.size(), H = hd.h, ld = 3 * D_ + 2, T = hd.nout;
+    const float *W1 = (const float *)hd.fc1->data, *b1 = (const float *)hd.fb1->data;
+    const float *W2 = (const float *)hd.fc2->data, *b2 = (const float *)hd.fb2->data;
     for (int c : chain) {
       Node &nd = nodes_[c];
       if ((int)nd.e.size() != D_) return false;
-      if (!nd.proj.empty()) continue;
-      nd.proj.resize(3 * H);
+      std::vector<float> &proj = nd.proj[slot];
+      if (!proj.empty()) continue;
+      proj.resize(3 * H);
       for (int j = 0; j < 3; j++)
 #ifdef __APPLE__
-        cblas_sgemv(CblasRowMajor, CblasNoTrans, H, D_, 1.f, W1 + j * D_, ld, nd.e.data(), 1, 0.f, nd.proj.data() + j * H, 1);
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, H, D_, 1.f, W1 + j * D_, ld, nd.e.data(), 1, 0.f, proj.data() + j * H, 1);
 #else
         for (int r = 0; r < H; r++) {
           double acc = 0;
           const float *w = W1 + j * D_ + (size_t)r * ld;
           for (int k = 0; k < D_; k++) acc += (double)w[k] * nd.e[k];
-          nd.proj[j * H + r] = (float)acc;
+          proj[j * H + r] = (float)acc;
         }
 #endif
     }
-    out->assign((size_t)n * 5, 0.f);
+    out->assign((size_t)n * T, 0.f);
     std::vector<float> pre(H);
+    float lg[8];
     for (int k = 0; k < n; k++) {
-      const float *p0 = nodes_[chain[k]].proj.data();
-      const float *p1 = k + 1 < n ? nodes_[chain[k + 1]].proj.data() + H : nullptr;
-      const float *p2 = k + 2 < n ? nodes_[chain[k + 2]].proj.data() + 2 * H : nullptr;
+      const float *p0 = nodes_[chain[k]].proj[slot].data();
+      const float *p1 = k + 1 < n ? nodes_[chain[k + 1]].proj[slot].data() + H : nullptr;
+      const float *p2 = k + 2 < n ? nodes_[chain[k + 2]].proj[slot].data() + 2 * H : nullptr;
       for (int r = 0; r < H; r++) {
         float v = b1[r] + p0[r];
         if (p1) v += p1[r] + W1[(size_t)r * ld + 3 * D_];
         if (p2) v += p2[r] + W1[(size_t)r * ld + 3 * D_ + 1];
         pre[r] = 0.5f * v * (1.f + std::erf(v * 0.70710678118654752f));
       }
-      float lg[5], mx = -INFINITY, sum = 0;
-      for (int t = 0; t < 5; t++) {
+      float mx = -INFINITY, sum = 0;
+      for (int t = 0; t < T; t++) {
         lg[t] = b2[t];
         for (int r = 0; r < H; r++) lg[t] += W2[(size_t)t * H + r] * pre[r];
         mx = std::max(mx, lg[t]);
       }
-      for (int t = 0; t < 5; t++) sum += (lg[t] = std::exp(lg[t] - mx));
-      for (int t = 0; t < 5; t++) (*out)[(size_t)5 * k + t] = lg[t] / sum;
+      for (int t = 0; t < T; t++) sum += (lg[t] = std::exp(lg[t] - mx));
+      for (int t = 0; t < T; t++) (*out)[(size_t)T * k + t] = lg[t] / sum;
     }
     return true;
   }
@@ -236,7 +256,7 @@ class TreeLM {
     if ((int)nodes_.size() >= cap_) return -1;
     int pos = parent < 0 ? 0 : nodes_[parent].pos + 1;
     if (pos >= npos_) return -1;
-    nodes_.push_back({parent, pos, tok, 0.f, {}});
+    nodes_.push_back({parent, pos, tok, 0.f, {}, {}, {}});
     return (int)nodes_.size() - 1;
   }
 
@@ -295,7 +315,7 @@ class TreeLM {
       h = ggml_gelu(ctx, ggml_add(ctx, ggml_mul_mat(ctx, Wl("blk.%d.ffn_up.weight", l), h), Wl("blk.%d.ffn_up.bias", l)));
       h = ggml_add(ctx, ggml_mul_mat(ctx, Wl("blk.%d.ffn_down.weight", l), h), Wl("blk.%d.ffn_down.bias", l));
       x = ggml_add(ctx, x, h);
-      if (ent_ok_ && l + 1 == ent_layer_) {
+      if (e_layer_ && l + 1 == e_layer_) {
         ent_x = ggml_norm(ctx, x, 1e-5f);  // F.layer_norm(h, (768,)): no weight, no bias
         ggml_set_output(ent_x);
       }
@@ -368,17 +388,27 @@ class TreeLM {
     int parent, pos, tok;
     float lse;
     std::vector<float> h;
-    std::vector<float> e, proj;  // entity head: layer-norm'd residual stream, and its three projections (lazy)
+    std::vector<float> e;        // heads: layer-norm'd residual stream after e_layer_ blocks
+    std::vector<float> proj[2];  // its three projections per head (0 entity, 1 segmentation), lazy
   };
+  // Tensors fc1.w [hidden, 3D+2], fc1.bias, fc2.w [nout, hidden], fc2.bias, all F32.
+  bool bind(Head &hd, const char *pre) {
+    char nm[32];
+    auto get = [&](const char *s) { snprintf(nm, sizeof nm, "%s.%s", pre, s); return W(nm); };
+    hd.fc1 = get("fc1.w"); hd.fb1 = get("fc1.bias"); hd.fc2 = get("fc2.w"); hd.fb2 = get("fc2.bias");
+    return hd.fc1 && hd.fb1 && hd.fc2 && hd.fb2 && hd.layer >= 1 && hd.layer < L_ && hd.h > 0 && hd.nout <= 8 &&
+           hd.fc1->type == GGML_TYPE_F32 && hd.fc2->type == GGML_TYPE_F32 && hd.fb1->type == GGML_TYPE_F32 &&
+           hd.fb2->type == GGML_TYPE_F32 && hd.fc1->ne[0] == 3 * D_ + 2 && hd.fc1->ne[1] == hd.h &&
+           hd.fc2->ne[0] == hd.h && hd.fc2->ne[1] == hd.nout && hd.fb1->ne[0] == hd.h && hd.fb2->ne[0] == hd.nout;
+  }
   int L_ = 0, D_ = 0, NH_ = 0, V_ = 0, npos_ = 0, cap_ = 0, done_ = 0;
   ggml_backend_t be_ = nullptr;
   ggml_context *wctx_ = nullptr, *rctx_ = nullptr, *kctx_ = nullptr;
   ggml_backend_buffer_t wbuf_ = nullptr, rbuf_ = nullptr, kbuf_ = nullptr;
   ggml_gallocr_t galloc_ = nullptr;
   ggml_tensor *wte_ = nullptr, *wpe_ = nullptr, *out_ = nullptr;
-  ggml_tensor *fc1_ = nullptr, *fb1_ = nullptr, *fc2_ = nullptr, *fb2_ = nullptr;
-  bool ent_ok_ = false;
-  int ent_layer_ = 0, ent_h_ = 0;
+  Head ent_, seg_;
+  int e_layer_ = 0;  // layer whose residual stream nodes keep for the heads; 0 = none
   std::vector<ggml_tensor *> kc_, vc_;
   std::vector<Node> nodes_;
   std::vector<std::string> tokens_;
