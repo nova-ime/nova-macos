@@ -52,6 +52,22 @@ if [ ! -f "$USERDIR/nova_wx_jp.dict.yaml" ]; then
 fi
 # GPT-2 标橙插件的模型和字表（约 111 MB，不进 git）。默认在 nova-lm/model/，可用 NOVA_LM_DIR 指定。
 LM="${NOVA_LM_DIR:-$ROOT/nova-lm/model}"
+# 本地没有时从 nova-model 的最新 Release 下载，按 SHA256SUMS 校验；下载失败或校验不过就当没有模型。
+MODEL_URL="${NOVA_MODEL_URL:-https://github.com/nova-ime/nova-model/releases/latest/download}"
+if [ ! -f "$LM/gpt2.gguf" ] || [ ! -f "$LM/charmap.tsv" ]; then
+  echo "下载 GPT-2 模型（约 111 MB）：$MODEL_URL"
+  DL=$(mktemp -d)
+  if (cd "$DL" && for f in SHA256SUMS gpt2.gguf charmap.tsv; do curl -fL --retry 3 -o "$f" "$MODEL_URL/$f" || exit 1; done &&
+      shasum -a 256 -c SHA256SUMS); then
+    mkdir -p "$LM"
+    mv "$DL/gpt2.gguf" "$DL/charmap.tsv" "$LM/"
+    # 用 sudo 跑时文件别留成 root 的
+    [ -n "${SUDO_USER:-}" ] && chown -R "$SUDO_USER" "$LM"
+  else
+    echo "模型下载或校验失败。"
+  fi
+  rm -rf "$DL"
+fi
 if [ -f "$LM/gpt2.gguf" ] && [ -f "$LM/charmap.tsv" ]; then
   mkdir -p "$USERDIR/nova_lm"
   cp "$LM/gpt2.gguf" "$LM/charmap.tsv" "$USERDIR/nova_lm/"

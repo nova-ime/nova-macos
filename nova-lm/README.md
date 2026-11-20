@@ -17,7 +17,8 @@ librime 滤镜 `nova_lm_filter`，接在 `lua_filter@*nova_sentences` 后面。�
 2. `scripts/build-nova.sh`：把插件、CPU 后端和 Homebrew 的 libggml、libomp 放进 app，改成 `@rpath`
    引用后签名。
 3. `scripts/install-nova.sh`：把 `nova-lm/model/` 里的模型和字表复制到用户目录的 `nova_lm/`。
-   没有模型时照常安装，插件原样放行。
+   本地没有时先从 [nova-model](https://github.com/nova-ime/nova-model/releases) 的最新 Release 下载并校验；
+   下载失败时照常安装，插件原样放行。
 
 Homebrew 升级 ggml 的主版本后（库名从 `libggml.0` 变成 `libggml.1`），插件链接的旧库就不在了，要重跑第 1 步；
 第 2 步发现这种情况会停下并提示。ggml 0.27 换成 1.0.0 后 GPT-2 的打分略有变化：1622 句评测（eval0）整句全对
@@ -25,7 +26,7 @@ Homebrew 升级 ggml 的主版本后（库名从 `libggml.0` 变成 `libggml.1`�
 
 ## 模型文件（不进 git）
 
-`nova-lm/model/` 里两个文件，约 111 MB：
+`nova-lm/model/` 里两个文件，约 111 MB，发布在 [nova-model](https://github.com/nova-ime/nova-model/releases)：
 
 - `gpt2.gguf`：[uer/gpt2-chinese-cluecorpussmall](https://huggingface.co/uer/gpt2-chinese-cluecorpussmall)
   用约 22 亿字的多领域中文语料继续训练 13.6 万步。损失是逐字的语言模型损失，加上只在同码字之间比较的同音损失。
