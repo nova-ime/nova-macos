@@ -16,9 +16,9 @@ librime 滤镜 `nova_lm_filter`，接在 `lua_filter@*nova_sentences` 后面。�
    `lib/rime-plugins/nova-lm/`。需要 Homebrew 的 `ggml` 和 `boost`。
 2. `scripts/build-nova.sh`：把插件、CPU 后端和 Homebrew 的 libggml、libomp 放进 app，改成 `@rpath`
    引用后签名。
-3. `scripts/install-nova.sh`：把 `nova-lm/model/` 里的模型和字表复制到用户目录的 `nova_lm/`。
-   本地没有时先从 [nova-model](https://github.com/nova-ime/nova-model/releases) 的最新 Release 下载并校验；
-   下载失败时照常安装，插件原样放行。
+   模型和字表也放进 app 的 `SharedSupport/nova_lm/`；本地没有时先用 `scripts/fetch-model.sh` 从
+   [nova-model](https://github.com/nova-ime/nova-model/releases) 的最新 Release 下载并校验。
+   插件先找用户目录的 `nova_lm/`，没有就用 app 自带的。
 
 Homebrew 升级 ggml 的主版本后（库名从 `libggml.0` 变成 `libggml.1`），插件链接的旧库就不在了，要重跑第 1 步；
 第 2 步发现这种情况会停下并提示。ggml 0.27 换成 1.0.0 后 GPT-2 的打分略有变化：1622 句评测（eval0）整句全对
@@ -39,7 +39,7 @@ Homebrew 升级 ggml 的主版本后（库名从 `libggml.0` 变成 `libggml.1`�
 - `charmap.tsv`：每行 `双拼码 \t 字`，来自万象词库的单字条目，只留 GB2312 内、且在 uer 词表里
   是单个 token 的字。beam 每个音节只在这些字里选。
 
-`nova_lm/entity: true` 把人名、地名合成一个词块（默认关）。需要带标注头的模型（GGUF 里有 `nova.ent.*` 元数据和 `ent.*` 权重）；模型里没有时自动保持关闭。
+`nova_lm/entity: true` 把人名、地名合成一个词块（`nova.schema.yaml` 里默认开）。需要带标注头的模型（GGUF 里有 `nova.ent.*` 元数据和 `ent.*` 权重）；模型里没有时自动保持关闭。
 `nova_lm/entity_threshold` 是名字里各字标签概率的最小值，默认 0.8。只改分块，不改字；碰到用户选过的块、焦点块、辅助码、简拼、打错键的块，
 或 `nova_bounds` 学到的边界时跳过；名字整个落在一个块里时不切出来。改 `entity` 后要重新部署，模型会在后台重新加载一次。开启后每键多跑一次整句最后一个字的前向。
 6486 句逐键评测（阈值 0.8，人名地名按 LTP 标注）：人名整个成一块 57.2% → 70.3%，地名 79.5% → 81.3%，整句全对 5328 → 5329。
