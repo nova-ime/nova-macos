@@ -7,19 +7,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Nova Squirrel"
+            "value" : "Nova"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Nova 鼠须管"
+            "value" : "Nova"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Nova 鼠鬚管"
+            "value" : "Nova"
           }
         }
       }
@@ -31,19 +31,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Nova Squirrel"
+            "value" : "Nova"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Nova 鼠须管"
+            "value" : "Nova"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Nova 鼠鬚管"
+            "value" : "Nova"
           }
         }
       }
@@ -54,19 +54,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Nova Squirrel"
+            "value" : "Nova"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Nova 鼠须管"
+            "value" : "Nova"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Nova 鼠鬚管"
+            "value" : "Nova"
           }
         }
       }
@@ -77,19 +77,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Nova Squirrel - Simplified"
+            "value" : "Nova"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Nova 鼠须管"
+            "value" : "Nova"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Nova 鼠须管"
+            "value" : "Nova"
           }
         }
       }
@@ -100,19 +100,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Nova Squirrel - Traditional"
+            "value" : "Nova 繁體"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Nova 鼠鬚管"
+            "value" : "Nova 繁體"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Nova 鼠鬚管"
+            "value" : "Nova 繁體"
           }
         }
       }

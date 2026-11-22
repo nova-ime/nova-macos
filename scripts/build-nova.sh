@@ -11,6 +11,34 @@ xcodebuild -project Squirrel.xcodeproj -scheme Squirrel -configuration Release \
 
 APP=build-release/Build/Products/Release/Squirrel.app
 FW="$APP/Contents/Frameworks"
+SS="$APP/Contents/SharedSupport"
+
+# Nova 的方案、词库、Lua 和 GPT-2 模型都放进 app 的共享数据目录，用户目录（~/Library/NovaSquirrel）
+# 从空开始，只放用户自己的 *.custom.yaml、用户词库和学到的词。官方带的 luna、terra 这些方案去掉。
+# 词库由 scripts/wanxiang/setup-wanxiang.sh 生成，缓存在 .scratch/wanxiang；NOVA_DICT_DIR 可以换目录。
+# 不用万象语法模型（.gram，420 MB）：它只让整句多对约 0.6%。
+DICT="${NOVA_DICT_DIR:-.scratch/wanxiang}"
+for f in nova_wx.dict.yaml nova_wx_jp.dict.yaml; do
+  [ -f "$DICT/$f" ] || { echo "没有词库 $DICT/$f。先运行 scripts/wanxiang/setup-wanxiang.sh。"; exit 1; }
+done
+scripts/fetch-model.sh
+LM="${NOVA_LM_DIR:-nova-lm/model}"
+(cd "$SS" && rm -rf build bopomofo* cangjie5* luna_* pinyin.yaml stroke* terra_* zhuyin.yaml essay.txt ./*.gram \
+  installation.yaml user.yaml lua nova_lm)
+cp nova-schema/nova.schema.yaml nova-schema/default.yaml nova-schema/symbols.yaml nova-schema/symbols.custom.yaml \
+  nova-schema/nova_lexicon.txt nova-schema/nova_quanpin.txt nova-schema/nova_shuangpin.txt nova-schema/nova_rare.txt \
+  "$DICT/nova_wx.dict.yaml" "$DICT/nova_wx_jp.dict.yaml" "$SS/"
+mkdir -p "$SS/lua" "$SS/nova_lm"
+cp nova-schema/lua/*.lua "$SS/lua/"
+cp "$LM/gpt2.gguf" "$LM/charmap.tsv" "$SS/nova_lm/"
+# 预先编好词库（SharedSupport/build），用户第一次切到 Nova 时不用等编译。--build 在当前目录里部署，
+# 会顺手写下 installation.yaml、user.yaml，不随 app 分发。
+(cd "$SS" && "$OLDPWD/$APP/Contents/MacOS/Squirrel" --build && rm -f installation.yaml user.yaml && rm -rf ./*.userdb)
+[ -f "$SS/build/nova_wx.table.bin" ] || { echo "预编译词库失败：$SS/build 里没有 nova_wx.table.bin"; exit 1; }
+# 词库源文件（178 MB）编好就不再需要：librime 找不到源文件时直接用 build 里的词库，
+# 用户的 nova.custom.yaml 改了拼写规则也只重编 prism，不碰词库。
+rm -f "$SS/nova_wx.dict.yaml" "$SS/nova_wx_jp.dict.yaml"
+echo "已放入 Nova 数据：$(du -sh "$SS" | cut -f1)"
 
 # GPT-2 标橙插件（nova-lm/build.sh 编出来的）连同它依赖的 Homebrew ggml、libomp 一起放进 app。
 # 这些库原本按 /opt/homebrew 的绝对路径互相引用，改成 @rpath，并给插件和 CPU 后端补上指向

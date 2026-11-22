@@ -1,0 +1,18 @@
+#!/bin/bash
+# Nova 安装包的安装后脚本（以 root 运行）：注册输入法，替当前登录的用户启用并选中 Nova。
+# 方案和词库已经在构建时编译好放进 app，这里不再部署。
+# 第一次切到 Nova 时会弹出设置面板，让用户选输入方式。
+TARGET="/Library/Input Methods/NovaSquirrel.app"
+BIN="$TARGET/Contents/MacOS/Squirrel"
+login_user=$(/usr/bin/stat -f%Su /dev/console)
+
+"$BIN" --register-input-source
+
+if [ -n "$login_user" ] && [ "$login_user" != "root" ]; then
+  uid=$(/usr/bin/id -u "$login_user")
+  as_user() { /bin/launchctl asuser "$uid" /usr/bin/sudo -u "$login_user" "$@"; }
+  as_user "$BIN" --enable-input-source || true
+  as_user "$BIN" --select-input-source || true
+  as_user /usr/bin/open "$TARGET" || true
+fi
+exit 0

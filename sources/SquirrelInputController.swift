@@ -177,6 +177,21 @@ final class SquirrelInputController: IMKInputController {
       client?.overrideKeyboard(withKeyboardNamed: keyboardLayout)
     }
     preedit = ""
+    // 第一次切到 Nova：打开设置面板先选输入方式。
+    if !NovaOptions.layoutChosen && !Self.welcomeShown {
+      Self.welcomeShown = true
+      DispatchQueue.main.async { NovaSettingsWindow.shared.show() }
+    }
+  }
+
+  private static var welcomeShown = false
+
+  // 设置面板（NovaSettings.swift）里的选择设给这个会话。
+  func applyNovaOptions() {
+    guard session != 0 else { return }
+    for (name, value) in NovaOptions.all where rimeAPI.get_option(session, name) != value {
+      rimeAPI.set_option(session, name, value)
+    }
   }
 
   override init!(server: IMKServer!, delegate: Any!, client: Any!) {
@@ -184,6 +199,9 @@ final class SquirrelInputController: IMKInputController {
     // print("[DEBUG] initWithServer: \(server ?? .init()) delegate: \(delegate ?? "nil") client:\(client ?? "nil")")
     super.init(server: server, delegate: delegate, client: client)
     createSession()
+    NotificationCenter.default.addObserver(forName: NovaOptions.changed, object: nil, queue: .main) { [weak self] _ in
+      self?.applyNovaOptions()
+    }
   }
 
   override func deactivateServer(_ sender: Any!) {
@@ -220,47 +238,51 @@ final class SquirrelInputController: IMKInputController {
     }
   }
 
+  // 菜单栏的 Nova 菜单：输入方式（单选）、设置、重新加载设置。
   override func menu() -> NSMenu! {
-    let deploy = NSMenuItem(title: NSLocalizedString("Deploy", comment: "Menu item"), action: #selector(deploy), keyEquivalent: "`")
+    let menu = NSMenu()
+    let current = NovaOptions.layout
+    for (index, item) in NovaOptions.layouts.enumerated() {
+      let entry = NSMenuItem(title: item.name, action: #selector(chooseLayout(_:)), keyEquivalent: "")
+      entry.target = self
+      entry.tag = index
+      entry.state = item.id == current ? .on : .off
+      menu.addItem(entry)
+    }
+    menu.addItem(.separator())
+    let settings = NSMenuItem(title: "设置…", action: #selector(openSettings), keyEquivalent: "")
+    settings.target = self
+    menu.addItem(settings)
+    let help = NSMenuItem(title: "使用说明", action: #selector(openHelp), keyEquivalent: "")
+    help.target = self
+    menu.addItem(help)
+    let deploy = NSMenuItem(title: "重新加载设置", action: #selector(deploy), keyEquivalent: "`")
     deploy.target = self
     deploy.keyEquivalentModifierMask = [.control, .option]
-    let sync = NSMenuItem(title: NSLocalizedString("Sync user data", comment: "Menu item"), action: #selector(syncUserData), keyEquivalent: "")
-    sync.target = self
-    let logDir = NSMenuItem(title: NSLocalizedString("Logs...", comment: "Menu item"), action: #selector(openLogFolder), keyEquivalent: "")
-    logDir.target = self
-    let setting = NSMenuItem(title: NSLocalizedString("Settings...", comment: "Menu item"), action: #selector(openRimeFolder), keyEquivalent: "")
-    setting.target = self
-    let wiki = NSMenuItem(title: NSLocalizedString("Rime Wiki...", comment: "Menu item"), action: #selector(openWiki), keyEquivalent: "")
-    wiki.target = self
-
-    let menu = NSMenu()
     menu.addItem(deploy)
-    menu.addItem(sync)
-    menu.addItem(logDir)
-    menu.addItem(setting)
-    menu.addItem(wiki)
-
     return menu
+  }
+
+  @objc func chooseLayout(_ sender: Any?) {
+    // IMK 菜单回调传进来的是一个字典，菜单项在 kIMKCommandMenuItemName 下。
+    var item = sender as? NSMenuItem
+    if item == nil, let info = sender as? [String: Any] {
+      item = info[kIMKCommandMenuItemName] as? NSMenuItem
+    }
+    guard let tag = item?.tag, NovaOptions.layouts.indices.contains(tag) else { return }
+    NovaOptions.layout = NovaOptions.layouts[tag].id
+  }
+
+  @objc func openSettings() {
+    NovaSettingsWindow.shared.show()
+  }
+
+  @objc func openHelp() {
+    NovaSettingsWindow.shared.show(tab: .help)
   }
 
   @objc func deploy() {
     NSApp.squirrelAppDelegate.deploy()
-  }
-
-  @objc func syncUserData() {
-    NSApp.squirrelAppDelegate.syncUserData()
-  }
-
-  @objc func openLogFolder() {
-    NSApp.squirrelAppDelegate.openLogFolder()
-  }
-
-  @objc func openRimeFolder() {
-    NSApp.squirrelAppDelegate.openRimeFolder()
-  }
-
-  @objc func openWiki() {
-    NSApp.squirrelAppDelegate.openWiki()
   }
 
   deinit {
@@ -333,6 +355,7 @@ private extension SquirrelInputController {
 
     if session != 0 {
       updateAppOptions()
+      applyNovaOptions()
     }
   }
 

@@ -1,0 +1,23 @@
+#!/bin/bash
+# Nova 安装包的安装前脚本（以 root 运行）。
+# 1. 退出正在运行的 Nova，免得旧进程占着文件。
+# 2. 删掉旧版整个 app：新版不带的文件（比如以前的语法模型）不会残留。
+# 3. 删掉早期装在 ~/Library/Input Methods 的旧版，免得两个同 ID 的 Nova 并存。
+# 用户目录 ~/Library/NovaSquirrel 不动。
+TARGET="/Library/Input Methods/NovaSquirrel.app"
+login_user=$(/usr/bin/stat -f%Su /dev/console)
+login_home=$(/usr/bin/dscl . -read "/Users/${login_user}" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+
+for app in "$TARGET" "${login_home}/Library/Input Methods/NovaSquirrel.app"; do
+  bin="$app/Contents/MacOS/Squirrel"
+  if [ -x "$bin" ] && [ "$login_user" != "root" ]; then
+    /usr/bin/sudo -u "$login_user" "$bin" --quit > /dev/null 2>&1 || true
+  fi
+done
+/usr/bin/killall -u "$login_user" Squirrel > /dev/null 2>&1 || true
+
+rm -rf "$TARGET"
+if [ -n "$login_home" ] && [ -d "${login_home}/Library/Input Methods/NovaSquirrel.app" ]; then
+  rm -rf "${login_home}/Library/Input Methods/NovaSquirrel.app"
+fi
+exit 0
