@@ -1,4 +1,6 @@
-# Nova 输入法（macOS）
+<img src="resources/brand/xingyu-512.png" width="96" alt="星语">
+
+# Nova 星语输入法（macOS）
 
 [![Release](https://img.shields.io/github/v/release/nova-ime/nova-macos)](https://github.com/nova-ime/nova-macos/releases/latest)
 ![Platform](https://img.shields.io/badge/macOS-13%2B%20%C2%B7%20Apple%20Silicon-lightgrey)
@@ -40,9 +42,9 @@
    - 搜狗双拼
    - 全拼
 
-   以后随时可以在菜单栏的 Nova 菜单里换。
+   以后随时可以在菜单栏的星语菜单里换。
 
-   如果输入法列表里没有 Nova，或者切过去打不出字，注销重新登录一次。
+   如果输入法列表里没有 Nova 星语，或者切过去打不出字，注销重新登录一次。
 
 升级时直接安装新版本即可，用户词库和设置都会保留。
 
@@ -62,7 +64,7 @@ sudo rm -rf "/Library/Input Methods/NovaSquirrel.app"
 2. **橙色的词，按数字改。** 没把握的词标成橙色，备选列在下面。按数字键换掉它，后面的词会跟着重新算。
 3. **改一个字，不用删整句。** 用 `←` `→` 把光标移到打错的地方直接改。
 
-菜单栏的 Nova 菜单里可以：
+菜单栏的星语菜单里可以：
 - 切换五种打法
 - 打开「设置…」：选项、使用说明、设置文件夹
 - 打开「使用说明」
@@ -137,7 +139,7 @@ sudo rm -rf "/Library/Input Methods/NovaSquirrel.app"
 
 ## 定制
 
-日常设置都在菜单栏的 Nova 菜单 →「设置…」窗口里点选，不用碰配置文件：
+日常设置都在菜单栏的星语菜单 →「设置…」窗口里点选，不用碰配置文件：
 - 打法
 - 全角字符
 - 中文状态下用英文标点

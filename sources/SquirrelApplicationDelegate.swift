@@ -95,7 +95,7 @@ final class SquirrelApplicationDelegate: NSObject, NSApplicationDelegate, UNUser
     squirrelTraits.setCString(SquirrelApp.userDir.path(), to: \.user_data_dir)
     squirrelTraits.setCString(SquirrelApp.logDir.path(), to: \.log_dir)
     squirrelTraits.setCString("Squirrel", to: \.distribution_code_name)
-    squirrelTraits.setCString("Nova", to: \.distribution_name)
+    squirrelTraits.setCString("Nova 星语", to: \.distribution_name)
     squirrelTraits.setCString(Bundle.main.object(forInfoDictionaryKey: kCFBundleVersionKey as String) as! String, to: \.distribution_version)
     squirrelTraits.setCString("rime.squirrel", to: \.app_name)
     rimeAPI.setup(&squirrelTraits)

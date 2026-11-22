@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <installer-gui-script minSpecVersion="2">
-    <title>Nova 输入法</title>
+    <title>Nova 星语输入法</title>
     <options customize="never" require-scripts="false" hostArchitectures="arm64"/>
     <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
     <os-version min="13.0"/>
