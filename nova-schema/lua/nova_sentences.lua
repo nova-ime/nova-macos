@@ -439,7 +439,12 @@ end
 
 local function load_lexicon()
     if lexicon_data then return end
-    local f = io.open(rime_api.get_user_data_dir() .. "/nova_lexicon.txt", "r")
+    -- 用户目录里的优先，没有就用安装包带的（共享目录）。
+    local f
+    for _, dir in ipairs({ rime_api.get_user_data_dir(), rime_api.get_shared_data_dir() }) do
+        f = io.open(dir .. "/nova_lexicon.txt", "r")
+        if f then break end
+    end
     if not f then lexicon_data = false; return end
     lexicon_data = f:read("a")
     f:close()

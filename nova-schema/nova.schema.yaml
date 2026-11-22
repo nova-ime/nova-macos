@@ -19,9 +19,9 @@ switches:
     states: [半角, 全角]
   - name: ascii_punct
     states: [。，, ．，]
-  # 全拼：打的拼音切成音节后换成自然码双拼，其余照双拼工作，见 lua/nova_quanpin.lua。
-  - name: quanpin
-    states: [双拼, 全拼]
+  # 输入方式。内部始终是自然码双拼：全拼和别家双拼都在 lua/nova_quanpin.lua 换成自然码，其余照双拼工作。
+  - options: [zrm, flypy, mspy, sogou, quanpin]
+    states: [自然码, 小鹤, 微软, 搜狗, 全拼]
 
 engine:
   processors:
@@ -81,8 +81,7 @@ speller:
 translator:
   dictionary: nova_wx
   prism: nova
-  # 沿用换词库之前学到的词（编码格式相同，约 97% 的条目在新词库里能查到）。
-  user_dict: moran
+  user_dict: nova
   contextual_suggestions: true
   max_homophones: 7
   spelling_hints: 0
@@ -107,16 +106,6 @@ recognizer:
     # 日期 orq、时间 osj、星期 oxq，见 lua/nova_phrases.lua。or、os、ox 在自然码里不是音节。
     date: "^o(rq|sj|xq)$"
 
-# 语法模型：整句排序靠它。
-# 参数照万象 README 推荐的设置。
-grammar:
-  language: wanxiang-lts-zh-hans
-  collocation_max_length: 6
-  collocation_min_length: 2
-  collocation_penalty: -14
-  non_collocation_penalty: -6
-  weak_collocation_penalty: -100
-  rear_penalty: -18
 
 # 每个词的罚项，和 log 词频同一量纲。100 句测试里 20 最好（0 时会拆成很多单字）。
 nova_sentences:

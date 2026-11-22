@@ -1,0 +1,32 @@
+# encoding: utf-8
+---
+patch:
+  # 常用中文括号直接上屏，不显示候选菜单。
+  "punctuator/full_shape/</=": 《
+  "punctuator/full_shape/>/=": 》
+  "punctuator/full_shape/[/=": 【
+  "punctuator/full_shape/]/=": 】
+  "punctuator/full_shape/{/=": 「
+  "punctuator/full_shape/}/=": 」
+
+  "punctuator/half_shape/</=": 《
+  "punctuator/half_shape/>/=": 》
+  "punctuator/half_shape/[/=": 【
+  "punctuator/half_shape/]/=": 】
+  "punctuator/half_shape/{/=": 「
+  "punctuator/half_shape/}/=": 」
+
+  # 其余带多个候选的符号也直接上屏（取原候选第一项），不弹候选菜单。
+  # 用 /+ 合并而不是逐项写路径：键里含 / 的符号没法写进路径。
+  "punctuator/half_shape/+":
+    '/': 、
+    '\': 、
+    '|': ·
+    '`': '`'
+    '~': '~'
+    '@': '@'
+    '#': '#'
+    '%': '%'
+    '$': ￥
+    '*': '*'
+    '=': '='
