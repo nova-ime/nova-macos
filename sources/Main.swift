@@ -150,6 +150,10 @@ struct SquirrelApp {
         NSApp.squirrelAppDelegate.setupRime()
         NSApp.squirrelAppDelegate.startRime(fullCheck: false)
         NSApp.squirrelAppDelegate.loadSettings()
+        // 用的不是自然码辅助码，而 app 升级后词条变了：按新词条重新生成词库，编好后自动重新加载。
+        if NovaAux.needsRebuild {
+          DispatchQueue.main.async { NovaAuxBuilder.shared.switchTo(NovaAux.scheme) }
+        }
         print("Squirrel reporting!")
       }
 
