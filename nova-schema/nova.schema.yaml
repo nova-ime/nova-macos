@@ -111,9 +111,9 @@ recognizer:
 nova_sentences:
   word_penalty: 20
 
-# 输入框里直接显示首选整句，不显示双拼。
+# 输入框里只留一个全角空格占位：按键和整句都在面板里，面板只有字母行和词块行两层。
 style:
-  inline_candidate: true
+  inline_candidate: false
   # 在词和备选下面显示词频比例。改完要重新部署。
   show_share: false
 

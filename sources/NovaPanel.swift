@@ -7,7 +7,7 @@
 
 import AppKit
 
-private final class NovaView: NSView {
+final class NovaView: NSView {
   var layoutResult: NovaLayout? {
     didSet { needsDisplay = true }
   }
@@ -26,18 +26,18 @@ private final class NovaView: NSView {
   override func draw(_ dirtyRect: NSRect) {
     guard let layout = layoutResult else { return }
     if layout.card {
-      NovaPalette.card.setFill()
-      NSBezierPath(roundedRect: bounds, xRadius: NovaLayout.cornerRadius, yRadius: NovaLayout.cornerRadius).fill()
+      layout.style.color(NOVA_COLOR_CARD).setFill()
+      NSBezierPath(roundedRect: bounds, xRadius: layout.cornerRadius, yRadius: layout.cornerRadius).fill()
     }
     for link in layout.links {
       link.color.setFill()
       link.rect.fill()
     }
-    NovaPalette.branch.setStroke()
+    layout.style.color(NOVA_COLOR_BRANCH).setStroke()
     layout.branches.lineWidth = 1
     layout.branches.stroke()
     for box in layout.boxes {
-      (box.color == NovaPalette.altFill && box.rect == hovered?.rect ? NovaPalette.altHover : box.color).setFill()
+      (box.token == NOVA_COLOR_ALT_FILL && box.rect == hovered?.rect ? layout.style.color(NOVA_COLOR_ALT_HOVER) : box.color).setFill()
       NSBezierPath(roundedRect: box.rect, xRadius: box.radius, yRadius: box.radius).fill()
     }
     for run in layout.runs {
@@ -52,6 +52,7 @@ final class NovaPanel: NSPanel {
   var position = NSRect.zero
 
   private let view = NovaView()
+  private let indicator = NovaIndicator()
   private var style = NovaStyle()
   private var statusMessage = ""
   private var statusTimer: Timer?
@@ -103,27 +104,15 @@ final class NovaPanel: NSPanel {
   }
 #endif
 
+  // 字体、字号、颜色、形状都在主题里（NovaThemes），这里只读和主题无关的几项。
   func load(config: SquirrelConfig) {
-    var style = NovaStyle()
-    let point = config.getDouble("style/font_point") ?? style.font.pointSize
-    style.font = Self.font(from: config.getString("style/font_face"), size: point)
+    var style = NovaStyle(theme: NovaThemes.current(dark: NovaThemes.systemDark))
     style.linear = config.getString("style/candidate_list_layout") == "linear"
     style.showShare = config.getBool("style/show_share") ?? false
     self.style = style
     inlinePreedit = config.getBool("style/inline_preedit") ?? false
     inlineCandidate = config.getBool("style/inline_candidate") ?? false
     statusType = config.getString("style/status_message_type") ?? "mix"
-  }
-
-  // font_face 可以写多个字体，逗号分隔，前面的优先。找不到的跳过，都找不到就用系统字体。
-  private static func font(from faces: String?, size: CGFloat) -> NSFont {
-    let fonts = (faces ?? "").split(separator: ",").compactMap { face -> NSFont? in
-      let name = face.trimmingCharacters(in: .whitespaces)
-      return NSFontManager.shared.font(withFamily: name, traits: [], weight: 5, size: size) ?? NSFont(name: name, size: size)
-    }
-    guard let first = fonts.first else { return .systemFont(ofSize: size) }
-    let descriptor = first.fontDescriptor.addingAttributes([.cascadeList: fonts.dropFirst().map(\.fontDescriptor)])
-    return NSFont(descriptor: descriptor, size: size) ?? first
   }
 
   func update(_ content: NovaContent) {
@@ -143,6 +132,7 @@ final class NovaPanel: NSPanel {
     }
     statusTimer?.invalidate()
     statusTimer = nil
+    indicator.dismiss()
     show(content)
   }
 
@@ -227,6 +217,12 @@ private extension NovaPanel {
   }
 
   func showStatus(_ message: String) {
+    // 中英、全半角切换：显示 logo 样式的「中」「英」「全」「半」。其余（输入方式名等）照旧用文字卡片。
+    if let glyph = NovaIndicator.glyph(for: message) {
+      hide()
+      indicator.show(glyph, caret: position, theme: NovaThemes.current(dark: NovaThemes.systemDark))
+      return
+    }
     var content = NovaContent()
     content.preedit = message
     show(content)
@@ -253,7 +249,7 @@ private extension NovaPanel {
       return anchor
     }
     // 树的左边贴着这段文字的开头。
-    let start = position.minX - NovaLayout.edge
+    let start = position.minX - NovaLayout.edge(style: style)
     let left = max(screen.minX + Self.screenMargin, min(start, screen.maxX - Self.minimumWidth - Self.screenMargin))
     let upward = wantsUpward(screen: screen)
     let edgeY = upward ? position.maxY + Self.caretGap : position.minY - Self.caretGap
@@ -269,6 +265,11 @@ private extension NovaPanel {
     // 用 visibleFrame 避开 Dock 和菜单栏。
     let display = NSScreen.screens.first { $0.frame.contains(position.origin) } ?? NSScreen.main
     let screen = display?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+    // 跟随系统时，深浅色可能在两次输入之间变了；主题改了也在这里换上。
+    let theme = NovaThemes.current(dark: NovaThemes.systemDark)
+    if theme !== style.theme {
+      style.theme = theme
+    }
     let anchor = currentAnchor(screen: screen)
     let layout = NovaLayout(content: content, style: style, maxWidth: anchor.maxWidth, upward: anchor.upward)
     view.layoutResult = layout
@@ -278,5 +279,99 @@ private extension NovaPanel {
     let originY = anchor.upward ? anchor.edgeY : anchor.edgeY - layout.size.height
     setFrame(NSRect(x: anchor.left, y: originY, width: layout.size.width, height: layout.size.height), display: true)
     orderFront(nil)
+  }
+}
+
+// 中英切换提示：logo 的两个直角括号，中间换成一个字。淡入、停留、淡出，不接收鼠标。
+final class NovaIndicator: NSPanel {
+  private let glyphView = GlyphView()
+  private var timer: Timer?
+
+  private static let side: CGFloat = 36
+  private static let gap: CGFloat = 4
+  private static let hold: TimeInterval = 0.8
+  private static let fadeIn: TimeInterval = 0.1
+  private static let fadeOut: TimeInterval = 0.25
+
+  static func glyph(for message: String) -> String? {
+    switch message {
+    case "中文", "中": return "中"
+    case "英文", "英", "A": return "英"
+    case "全角", "全": return "全"
+    case "半角", "半": return "半"
+    default: return nil
+    }
+  }
+
+  init() {
+    super.init(contentRect: NSRect(x: 0, y: 0, width: Self.side, height: Self.side),
+               styleMask: [.nonactivatingPanel, .borderless], backing: .buffered, defer: true)
+    level = .init(Int(CGShieldingWindowLevel()))
+    hasShadow = true
+    isOpaque = false
+    backgroundColor = .clear
+    ignoresMouseEvents = true
+    glyphView.frame = NSRect(x: 0, y: 0, width: Self.side, height: Self.side)
+    contentView = glyphView
+  }
+
+  func show(_ glyph: String, caret: NSRect, theme: NovaTheme) {
+    glyphView.glyph = glyph
+    glyphView.fill = theme.color(NOVA_COLOR_CARD)
+    glyphView.ink = theme.color(NOVA_COLOR_PRIMARY)
+    glyphView.needsDisplay = true
+
+    // 光标右下方；放不下就挪到屏幕内。
+    let screen = (NSScreen.screens.first { $0.frame.contains(caret.origin) } ?? NSScreen.main)?.visibleFrame
+      ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+    var origin = NSPoint(x: caret.maxX + Self.gap, y: caret.minY - Self.gap - Self.side)
+    if origin.y < screen.minY { origin.y = caret.maxY + Self.gap }
+    origin.x = min(max(origin.x, screen.minX), screen.maxX - Self.side)
+    setFrameOrigin(origin)
+
+    timer?.invalidate()
+    alphaValue = 0
+    orderFront(nil)
+    NSAnimationContext.runAnimationGroup { $0.duration = Self.fadeIn; animator().alphaValue = 1 }
+    timer = Timer.scheduledTimer(withTimeInterval: Self.fadeIn + Self.hold, repeats: false) { [weak self] _ in
+      guard let self else { return }
+      NSAnimationContext.runAnimationGroup({ $0.duration = Self.fadeOut; self.animator().alphaValue = 0 }) {
+        if self.alphaValue == 0 { self.orderOut(nil) }
+      }
+    }
+  }
+
+  func dismiss() {
+    guard isVisible else { return }
+    timer?.invalidate()
+    timer = nil
+    orderOut(nil)
+  }
+
+  private final class GlyphView: NSView {
+    var glyph = "中"
+    var fill = NSColor.white
+    var ink = NSColor.black
+    override var isFlipped: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+      let s = bounds.width / 256
+      fill.setFill()
+      NSBezierPath(roundedRect: bounds, xRadius: 40 * s, yRadius: 40 * s).fill()
+      // logo 的两个直角括号（resources/brand/xingyu-glyph.svg，256 画布）。
+      ink.setFill()
+      let brackets = NSBezierPath()
+      for poly in [[(36, 36), (112, 36), (112, 64), (64, 64), (64, 148), (36, 148)],
+                   [(220, 220), (144, 220), (144, 192), (192, 192), (192, 108), (220, 108)]] {
+        brackets.move(to: NSPoint(x: CGFloat(poly[0].0) * s, y: CGFloat(poly[0].1) * s))
+        for p in poly.dropFirst() { brackets.line(to: NSPoint(x: CGFloat(p.0) * s, y: CGFloat(p.1) * s)) }
+        brackets.close()
+      }
+      brackets.fill()
+      let font = NSFont(name: "PingFangSC-Semibold", size: 104 * s) ?? .systemFont(ofSize: 104 * s, weight: .semibold)
+      let text = NSAttributedString(string: glyph, attributes: [.font: font, .foregroundColor: ink])
+      let size = text.size()
+      text.draw(at: NSPoint(x: (bounds.width - size.width) / 2, y: (bounds.height - size.height) / 2))
+    }
   }
 }

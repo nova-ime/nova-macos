@@ -514,7 +514,10 @@ private extension SquirrelInputController {
           // each character in preedit. note this is a full-shape space U+3000;
           // using half shape characters like "..." will result in an unstable
           // baseline when composing Chinese characters.
-          show(preedit: preedit.isEmpty ? "" : "　", selRange: NSRange(location: 0, length: 0), caretPos: 0)
+          // Nova: 占位每个键都要重新设一次。内容没变就不调 setMarkedText 的话，
+          // 有的终端会认为这个键没被输入法处理，把字母直接写进正文。
+          show(preedit: preedit.isEmpty ? "" : "　", selRange: NSRange(location: 0, length: 0), caretPos: 0,
+               force: !preedit.isEmpty)
         }
       }
 
@@ -555,10 +558,10 @@ private extension SquirrelInputController {
     hidePalettes()
   }
 
-  func show(preedit: String, selRange: NSRange, caretPos: Int) {
+  func show(preedit: String, selRange: NSRange, caretPos: Int, force: Bool = false) {
     guard let client = client else { return }
     // print("[DEBUG] showPreeditString: '\(preedit)'")
-    if self.preedit == preedit && self.caretPos == caretPos && self.selRange == selRange {
+    if !force && self.preedit == preedit && self.caretPos == caretPos && self.selRange == selRange {
       return
     }
 

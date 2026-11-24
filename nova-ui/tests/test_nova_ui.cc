@@ -1,6 +1,8 @@
 // nova-ui 的单元测试：解析、内容组装、排版（用固定宽度的假测宽函数）。
 // 构建运行：make -C nova-ui test
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -174,14 +176,17 @@ static void TestAssemble() {
     CHECK(a.v->block_count == 0);
   }
   {
-    NovaUIAssembleInput x = in;  // 只有一个字母：树是空行，什么都不显示
+    NovaUIAssembleInput x = in;  // 只有一个字母：树是空行，没有词块，面板把这个字母当输入文字显示
     std::string one = "\n";
     x.prop_tree = one.c_str();
     x.input = "w";
     Assembled a(x);
     CHECK(a.v->block_count == 0 && a.v->candidate_count == 0);
     CHECK_STR(a.v->letters, "w");
-    CHECK_STR(a.v->preedit, "");
+    CHECK_STR(a.v->preedit, "w");
+    x.inline_preedit = 1;  // 输入框里已经显示了这个字母：面板不再显示
+    Assembled b(x);
+    CHECK_STR(b.v->preedit, "");
   }
   {
     NovaUIAssembleInput x = in;  // 光标：属性有效时夹在 [0, 长度]，解析不了就在末尾
@@ -239,7 +244,10 @@ struct Laid {
   NovaUILayout* l;
   const NovaUILayoutView* v;
   Laid(const NovaUIContent& c, double size, bool linear, bool share, double max_width, bool upward) {
-    NovaUIStyle s = {size, linear, share};
+    NovaUIStyle s = {};
+    s.font_size = size;
+    s.linear = linear;
+    s.show_share = share;
     l = nova_ui_layout_create(&c, &s, FakeMeasure, nullptr, max_width, upward);
     v = nova_ui_layout_view(l);
   }
@@ -330,7 +338,7 @@ static void TestLayoutTree() {
     // 焦点块用 FOCUS 底色，字是黑的
     CHECK(L.v->boxes[1].color == NOVA_COLOR_FOCUS);
     CHECK(L.Run("你好")->color == NOVA_COLOR_BLACK);
-    CHECK(L.Run("我")->color == NOVA_COLOR_PRIMARY);
+    CHECK(L.Run("我")->color == NOVA_COLOR_CHIP_TEXT);
     // 备选 cell：x = 词块 x + 16；第一行 y = 10 + 24 + 5
     CHECK_NEAR(L.v->hits[2].rect.x, 48 + 16);
     CHECK_NEAR(L.v->hits[2].rect.y, 10 + 24 + 5);
@@ -359,7 +367,8 @@ static void TestLayoutTree() {
     // 词块的下边在 top + height（top = 10，没有字母行）
     CHECK_NEAR(L.v->hits[0].rect.y + L.v->hits[0].rect.height, 10 + tier_height);
     CHECK(L.v->hits[2].rect.y < L.v->hits[0].rect.y);
-    CHECK(L.v->hits[3].rect.y < L.v->hits[2].rect.y);  // 第二个备选更靠上
+    CHECK(L.v->hits[3].rect.y > L.v->hits[2].rect.y);  // 编号仍从上往下读：第二个备选在第一个下面
+    CHECK(L.v->hits[3].rect.y < L.v->hits[0].rect.y);  // 两个备选都在词块上方
   }
   {
     Laid L(c, 15, false, false, 60, false);  // 很窄：每块各占一排（limit = 40，36 放得下一块）
@@ -517,12 +526,144 @@ static void TestLayoutList() {
     for (int i = 1; i < 3; i++) wrapped = wrapped || L.v->hits[i].rect.y > L.v->hits[0].rect.y;
     CHECK(wrapped);
   }
-  NovaUIStyle s = {15, 0, 0};  // fullHeight：20 + 24 + 0 + 5 + 6 * 26
+  NovaUIStyle s = {};  // fullHeight：20 + 24 + 0 + 5 + 6 * 26
+  s.font_size = 15;
   CHECK_NEAR(nova_ui_full_height(&s), 20 + 24 + 5 + 6 * 26);
   s.show_share = 1;
   CHECK_NEAR(nova_ui_full_height(&s), 20 + 24 + 13 + 5 + 6 * (23 + 13));
   CHECK_NEAR(nova_ui_corner_radius(), 10);
   CHECK_NEAR(nova_ui_edge(), 10);
+}
+
+static void TestTheme() {
+  // 默认主题和默认颜色表一致，dump 再 parse 回来不变。
+  NovaUITheme* t = nova_ui_theme_new();
+  double a[4], b[4];
+  for (int i = 0; i < NOVA_COLOR_COUNT; i++) {
+    nova_ui_theme_color(t, static_cast<NovaUIColor>(i), a);
+    nova_ui_default_color(static_cast<NovaUIColor>(i), b);
+    for (int k = 0; k < 4; k++) CHECK(std::fabs(a[k] - b[k]) < 1.0 / 255);
+  }
+  CHECK_STR(nova_ui_theme_check(t), "");
+  const std::string dumped = nova_ui_theme_dump(t);
+  NovaUITheme* back = nova_ui_theme_parse(dumped.c_str());
+  CHECK_STR(nova_ui_theme_problems(back), "");
+  CHECK_STR(nova_ui_theme_dump(back), dumped);
+  nova_ui_theme_free(back);
+
+  // set / get：颜色、数字夹到范围、非法值不改。
+  CHECK(nova_ui_theme_set(t, "colors/blue", "#112233"));
+  CHECK_STR(nova_ui_theme_get(t, "colors/blue"), "#112233");
+  CHECK(nova_ui_theme_set(t, "colors/blue", "11223380"));
+  CHECK_STR(nova_ui_theme_get(t, "colors/blue"), "#11223380");
+  CHECK(!nova_ui_theme_set(t, "colors/blue", "#12"));
+  CHECK_STR(nova_ui_theme_get(t, "colors/blue"), "#11223380");
+  CHECK(nova_ui_theme_set(t, "font/size", "99"));
+  CHECK_STR(nova_ui_theme_get(t, "font/size"), "40");
+  CHECK(!nova_ui_theme_set(t, "font/size", "abc"));
+  CHECK(!nova_ui_theme_set(t, "appearance", "blue"));
+  CHECK(nova_ui_theme_set(t, "appearance", "light"));
+  CHECK(!nova_ui_theme_set(t, "nope", "1"));
+  CHECK(nova_ui_theme_get(t, "nope") == nullptr);
+  nova_ui_theme_free(t);
+
+  // parse：小节、引号、注释、不认识的键、缺的字段用默认。
+  t = nova_ui_theme_parse(
+      "\xEF\xBB\xBF# 注释\n"
+      "version: 1\n"
+      "name: \"浅 #色\"  # 引号里的 # 不是注释\n"
+      "appearance: light\n"
+      "font:\n"
+      "  face: 'PingFang SC, Microsoft YaHei'\n"
+      "  size: 18\n"
+      "shape:\n"
+      "  chip_radius: 0\n"
+      "  wobble: 3\n"
+      "colors:\n"
+      "  blue: \"#0000ff\"\n"
+      "  green: 绿\n"
+      "oops\n");
+  CHECK_STR(nova_ui_theme_get(t, "name"), "浅 #色");
+  CHECK_STR(nova_ui_theme_get(t, "appearance"), "light");
+  CHECK_STR(nova_ui_theme_get(t, "font/face"), "PingFang SC, Microsoft YaHei");
+  CHECK_STR(nova_ui_theme_get(t, "colors/blue"), "#0000ff");
+  CHECK_STR(nova_ui_theme_get(t, "shape/edge"), "10");
+  const std::string problems = nova_ui_theme_problems(t);
+  CHECK(problems.find("第 10 行") != std::string::npos);  // wobble
+  CHECK(problems.find("第 13 行") != std::string::npos);  // 绿
+  CHECK(problems.find("第 14 行") != std::string::npos);  // oops
+  NovaUIStyle s = {};
+  s.linear = 1;
+  nova_ui_theme_style(t, &s);
+  CHECK_NEAR(s.font_size, 18);
+  CHECK(s.linear == 1);
+  CHECK(s.chip_radius > 0 && s.chip_radius < 1e-6);  // 0 圆角是真的 0，不是「用默认」
+  CHECK_NEAR(s.card_radius, 10);
+  nova_ui_theme_free(t);
+
+  // check：字看不清、两种词块颜色太像。
+  t = nova_ui_theme_new();
+  nova_ui_theme_set(t, "colors/chip_text", "#ffffff");
+  nova_ui_theme_set(t, "colors/green", "#eeeeee");
+  nova_ui_theme_set(t, "colors/purple", nova_ui_theme_get(t, "colors/blue"));
+  const std::string warn = nova_ui_theme_check(t);
+  CHECK(warn.find("「选过的词」上的「词块上的字」") != std::string::npos);
+  CHECK(warn.find("「普通词块」和「改过的词」颜色太像") != std::string::npos);
+  nova_ui_theme_free(t);
+
+  // 圆角、留白真的进了排版。
+  NovaUIStyle round = {};
+  round.font_size = 15;
+  NovaUIStyle square = round;
+  square.card_radius = 1e-9;
+  square.edge = 4;
+  CHECK_NEAR(nova_ui_style_corner_radius(&round), 10);
+  CHECK(nova_ui_style_corner_radius(&square) < 1e-6);
+  CHECK_NEAR(nova_ui_style_edge(&square), 4);
+}
+
+static void TestThemeFiles() {
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "nova_ui_theme_test";
+  fs::remove_all(root);
+  fs::create_directories(root / "shared");
+  fs::create_directories(root / "user");
+  NovaUITheme* t = nova_ui_theme_new();
+  CHECK(nova_ui_theme_save(t, (root / "shared" / "dark.yaml").string().c_str()));
+  nova_ui_theme_set(t, "name", "浅色");
+  nova_ui_theme_set(t, "appearance", "light");
+  CHECK(nova_ui_theme_save(t, (root / "shared" / "light.yaml").string().c_str()));
+  nova_ui_theme_set(t, "name", "我的浅色");
+  CHECK(nova_ui_theme_save(t, (root / "user" / "light.yaml").string().c_str()));
+  CHECK(!fs::exists(root / "user" / "light.yaml.tmp"));
+  nova_ui_theme_free(t);
+  std::ofstream(root / "user" / "notes.txt") << "x";
+
+  NovaUIThemeList* list =
+      nova_ui_theme_list((root / "shared").string().c_str(), (root / "user").string().c_str());
+  int n = 0;
+  const NovaUIThemeEntry* e = nova_ui_theme_list_entries(list, &n);
+  CHECK(n == 2);
+  if (n == 2) {
+    CHECK_STR(e[0].id, "dark");
+    CHECK_STR(e[0].name, "深色");
+    CHECK(e[0].user == 0);
+    CHECK_STR(e[1].id, "light");
+    CHECK_STR(e[1].name, "我的浅色");  // 用户的覆盖自带的
+    CHECK_STR(e[1].appearance, "light");
+    CHECK(e[1].user == 1);
+    NovaUITheme* loaded = nova_ui_theme_load(e[1].path);
+    CHECK(loaded != nullptr);
+    if (loaded) CHECK_STR(nova_ui_theme_get(loaded, "name"), "我的浅色");
+    nova_ui_theme_free(loaded);
+  }
+  nova_ui_theme_list_free(list);
+  CHECK(nova_ui_theme_load((root / "missing.yaml").string().c_str()) == nullptr);
+  list = nova_ui_theme_list((root / "missing").string().c_str(), nullptr);
+  nova_ui_theme_list_entries(list, &n);
+  CHECK(n == 0);
+  nova_ui_theme_list_free(list);
+  fs::remove_all(root);
 }
 
 int main() {
@@ -534,6 +675,8 @@ int main() {
   TestLayoutOverviewAndPage();
   TestLayoutLetters();
   TestLayoutList();
+  TestTheme();
+  TestThemeFiles();
   std::printf("%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;
 }

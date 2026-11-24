@@ -92,6 +92,9 @@
 		A10E00020000000000000000 /* model.cc in Sources */ = {isa = PBXBuildFile; fileRef = A10E00010000000000000000 /* model.cc */; settings = {COMPILER_FLAGS = "-std=c++17 -ffp-contract=off"; }; };
 		A10E00040000000000000000 /* layout.cc in Sources */ = {isa = PBXBuildFile; fileRef = A10E00030000000000000000 /* layout.cc */; settings = {COMPILER_FLAGS = "-std=c++17 -ffp-contract=off"; }; };
 		A10E00060000000000000000 /* rime_glue.cc in Sources */ = {isa = PBXBuildFile; fileRef = A10E00050000000000000000 /* rime_glue.cc */; settings = {COMPILER_FLAGS = "-std=c++17 -ffp-contract=off -DNOVA_UI_RIME_STDBOOL"; }; };
+		A10E00080000000000000000 /* theme.cc in Sources */ = {isa = PBXBuildFile; fileRef = A10E00070000000000000000 /* theme.cc */; settings = {COMPILER_FLAGS = "-std=c++17 -ffp-contract=off"; }; };
+		B3A1C0082F00000100A1C001 /* NovaTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = B3A1C0072F00000100A1C001 /* NovaTheme.swift */; };
+		B3A1C0062F00000100A1C001 /* NovaThemeEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = B3A1C0052F00000100A1C001 /* NovaThemeEditor.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -300,6 +303,9 @@
 		A10E00010000000000000000 /* model.cc */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = model.cc; path = nova-ui/src/model.cc; sourceTree = "<group>"; };
 		A10E00030000000000000000 /* layout.cc */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = layout.cc; path = nova-ui/src/layout.cc; sourceTree = "<group>"; };
 		A10E00050000000000000000 /* rime_glue.cc */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = rime_glue.cc; path = nova-ui/src/rime_glue.cc; sourceTree = "<group>"; };
+		A10E00070000000000000000 /* theme.cc */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = theme.cc; path = nova-ui/src/theme.cc; sourceTree = "<group>"; };
+		B3A1C0072F00000100A1C001 /* NovaTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = NovaTheme.swift; path = sources/NovaTheme.swift; sourceTree = "<group>"; };
+		B3A1C0052F00000100A1C001 /* NovaThemeEditor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = NovaThemeEditor.swift; path = sources/NovaThemeEditor.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -328,10 +334,13 @@
 				B39771282BED9B250093A49B /* NovaSettings.swift */,
 				B3A1C0032F00000100A1C001 /* NovaAuxDict.swift */,
 				B3A1C0012F00000100A1C001 /* NovaAuxGen.swift */,
+				B3A1C0072F00000100A1C001 /* NovaTheme.swift */,
+				B3A1C0052F00000100A1C001 /* NovaThemeEditor.swift */,
 				B397712A2BEE4C160093A49B /* NovaPanel.swift */,
 				A10E00010000000000000000 /* model.cc */,
 				A10E00030000000000000000 /* layout.cc */,
 				A10E00050000000000000000 /* rime_glue.cc */,
+				A10E00070000000000000000 /* theme.cc */,
 				B39771242BED899F0093A49B /* SquirrelConfig.swift */,
 				B35D2FE72BF00839009D156B /* BridgingFunctions.swift */,
 				B38E9B8F2BE9AE1E0036ABEF /* Squirrel-Bridging-Header.h */,
@@ -598,6 +607,9 @@
 				A10E00020000000000000000 /* model.cc in Sources */,
 				A10E00040000000000000000 /* layout.cc in Sources */,
 				A10E00060000000000000000 /* rime_glue.cc in Sources */,
+				A10E00080000000000000000 /* theme.cc in Sources */,
+				B3A1C0082F00000100A1C001 /* NovaTheme.swift in Sources */,
+				B3A1C0062F00000100A1C001 /* NovaThemeEditor.swift in Sources */,
 				B35D2FE82BF00839009D156B /* BridgingFunctions.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -616,7 +628,7 @@
 				CODE_SIGN_ENTITLEMENTS = resources/Squirrel.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 1.0.2;
+				CURRENT_PROJECT_VERSION = 1.0.3;
 				DEAD_CODE_STRIPPING = YES;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
@@ -672,7 +684,7 @@
 				CLANG_ENABLE_OBJC_ARC = YES;
 				CODE_SIGN_ENTITLEMENTS = resources/Squirrel.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1.0.2;
+				CURRENT_PROJECT_VERSION = 1.0.3;
 				DEAD_CODE_STRIPPING = YES;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",

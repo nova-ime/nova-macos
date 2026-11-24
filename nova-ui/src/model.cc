@@ -206,6 +206,7 @@ void nova_ui_default_color(NovaUIColor color, double rgba[4]) {
     case NOVA_COLOR_DIM: grey(0.62); break;
     case NOVA_COLOR_SHARE: grey(0.5); break;
     case NOVA_COLOR_BLACK: grey(0); break;
+    case NOVA_COLOR_CHIP_TEXT: grey(1); break;
     default: grey(0); break;
   }
 }
@@ -263,8 +264,15 @@ NovaUIContentHandle* nova_ui_assemble(const NovaUIAssembleInput* in) {
   }
 
   // 空行表示还没有词块（只打了一个字母），这时什么都不显示。
+  // 不内嵌时应用里只有占位，这时面板要把这个字母显示出来，否则删到最后一个字母时看不到它。
   const bool no_candidates = tree == "\n";
-  h->preedit = in->inline_preedit || !h->letters.empty() ? "" : str(in->preedit);
+  if (in->inline_preedit) {
+    h->preedit = "";
+  } else if (no_candidates) {
+    h->preedit = h->letters;
+  } else {
+    h->preedit = h->letters.empty() ? str(in->preedit) : "";
+  }
 
   NovaUITree* parsed_tree = nova_ui_tree_parse(tree.c_str());
   h->tree = std::move(*parsed_tree);

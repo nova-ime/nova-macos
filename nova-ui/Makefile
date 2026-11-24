@@ -7,13 +7,14 @@ CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -ffp-contract=off
 RIME_INC ?= ../librime/src
 BUILD ?= build
 
-CORE := src/model.cc src/layout.cc
+CORE := src/model.cc src/layout.cc src/theme.cc
 
 $(BUILD)/libnova_ui.a: $(CORE)
 	@mkdir -p $(BUILD)
 	$(CXX) $(CXXFLAGS) -c src/model.cc -o $(BUILD)/model.o
 	$(CXX) $(CXXFLAGS) -c src/layout.cc -o $(BUILD)/layout.o
-	ar rcs $@ $(BUILD)/model.o $(BUILD)/layout.o
+	$(CXX) $(CXXFLAGS) -c src/theme.cc -o $(BUILD)/theme.o
+	ar rcs $@ $(BUILD)/model.o $(BUILD)/layout.o $(BUILD)/theme.o
 
 $(BUILD)/test_nova_ui: tests/test_nova_ui.cc $(BUILD)/libnova_ui.a include/nova_ui.h
 	$(CXX) $(CXXFLAGS) tests/test_nova_ui.cc $(BUILD)/libnova_ui.a -o $@

@@ -38,6 +38,7 @@ typedef enum {
   NOVA_COLOR_DIM,        /* 次要文字 */
   NOVA_COLOR_SHARE,      /* 词频比例的小字 */
   NOVA_COLOR_BLACK,      /* 焦点块（黄底）上的字 */
+  NOVA_COLOR_CHIP_TEXT,  /* 蓝、橙、紫、绿词块上的字（主题里是 chip_text；默认白） */
   NOVA_COLOR_COUNT
 } NovaUIColor;
 
@@ -175,6 +176,15 @@ typedef struct {
   double font_size; /* 正文字号 */
   int linear;       /* 普通列表横排 */
   int show_share;   /* 在词和备选下面显示词频比例，对应 style/show_share */
+  /* 以下是主题里的形状，0 表示用默认值（括号里），只写前三项的旧代码不受影响。
+   * nova_ui_theme_style 会按主题填好。 */
+  double card_radius;  /* 普通列表底板的圆角（10） */
+  double chip_radius;  /* 词块、备选格的圆角（6） */
+  double edge;         /* 面板四周留白（10） */
+  double chip_padding; /* 词块左右留白（8） */
+  double column_gap;   /* 词块之间的距离（12） */
+  double row_height;   /* 行高 / 字号（1.5） */
+  double chip_height;  /* 词块高 / 字号（1.6） */
 } NovaUIStyle;
 
 typedef struct {
@@ -252,8 +262,68 @@ void nova_ui_layout_free(NovaUILayout* layout);
 
 /* 词块加满备选的高度，用来判断光标下方放不放得下。 */
 double nova_ui_full_height(const NovaUIStyle* style);
+/* 默认形状的圆角和留白。按主题画时用下面带 style 的版本。 */
 double nova_ui_corner_radius(void);
 double nova_ui_edge(void);
+double nova_ui_style_corner_radius(const NovaUIStyle* style);
+double nova_ui_style_edge(const NovaUIStyle* style);
+
+/* ---- 主题 ----
+ * 一套主题 = 颜色 + 字体 + 字号 + 形状，存成一个 .yaml。只认 yaml 的一个子集：
+ *   顶层 `key: value`，或者 `section:` 后面跟缩进的 `key: value`；值可以加引号；# 后是注释。
+ * 键名写成 "section/key"（例如 "colors/blue"、"shape/chip_radius"），全部字段见 nova_ui_theme_fields。
+ * 缺的字段用默认主题（深色）的值；不认识的键和不合法的值跳过，记进 nova_ui_theme_problems。
+ * 路径都是 UTF-8。返回的 const char* 归主题所有，下一次调用同一个函数之前有效。 */
+
+typedef enum { NOVA_THEME_TEXT = 0, NOVA_THEME_CHOICE, NOVA_THEME_NUMBER, NOVA_THEME_COLOR } NovaUIThemeKind;
+
+typedef struct {
+  const char* key;   /* "colors/blue" */
+  const char* group; /* 设置面板里的分组：信息、字体、形状、颜色 */
+  const char* label; /* 设置面板里的名字 */
+  const char* note;  /* 说明，可以是空串 */
+  NovaUIThemeKind kind;
+  double min, max, step; /* NUMBER 用 */
+  const char* choices;   /* CHOICE 用，逗号分隔 */
+} NovaUIThemeField;
+
+typedef struct NovaUITheme NovaUITheme;
+
+const NovaUIThemeField* nova_ui_theme_fields(int* count);
+NovaUITheme* nova_ui_theme_new(void); /* 默认主题 */
+NovaUITheme* nova_ui_theme_parse(const char* yaml);
+NovaUITheme* nova_ui_theme_load(const char* path); /* 文件打不开时返回 NULL */
+NovaUITheme* nova_ui_theme_copy(const NovaUITheme* theme);
+void nova_ui_theme_free(NovaUITheme* theme);
+/* 读文件时跳过的行，一行一条；空串表示没有。 */
+const char* nova_ui_theme_problems(const NovaUITheme* theme);
+/* 值都是字符串：颜色 "#rrggbb" 或 "#rrggbbaa"，数字 "%g"。不认识的键返回 NULL。 */
+const char* nova_ui_theme_get(NovaUITheme* theme, const char* key);
+/* 成功返回 1。数字超出范围时夹到范围内。 */
+int nova_ui_theme_set(NovaUITheme* theme, const char* key, const char* value);
+const char* nova_ui_theme_dump(NovaUITheme* theme);
+int nova_ui_theme_save(NovaUITheme* theme, const char* path); /* 先写临时文件再改名 */
+/* theme 为 NULL 时给默认颜色。 */
+void nova_ui_theme_color(const NovaUITheme* theme, NovaUIColor color, double rgba[4]);
+/* 填 font_size 和形状；linear、show_share 不动。 */
+void nova_ui_theme_style(const NovaUITheme* theme, NovaUIStyle* style);
+/* 看不清的地方，一行一条；空串表示没问题：字和底色对比度不够、几种词块颜色太像。 */
+const char* nova_ui_theme_check(NovaUITheme* theme);
+
+/* 列出主题：shared_dir 是 app 自带的，user_dir 是用户的，同名（文件名）时用户的覆盖自带的。
+ * 按文件名排序。目录不存在时当作空。 */
+typedef struct {
+  const char* id;         /* 文件名去掉 .yaml */
+  const char* name;       /* 主题里的 name */
+  const char* path;
+  const char* appearance; /* dark / light */
+  int user;               /* 1：在用户目录里 */
+} NovaUIThemeEntry;
+
+typedef struct NovaUIThemeList NovaUIThemeList;
+NovaUIThemeList* nova_ui_theme_list(const char* shared_dir, const char* user_dir);
+const NovaUIThemeEntry* nova_ui_theme_list_entries(const NovaUIThemeList* list, int* count);
+void nova_ui_theme_list_free(NovaUIThemeList* list);
 
 #ifdef __cplusplus
 }

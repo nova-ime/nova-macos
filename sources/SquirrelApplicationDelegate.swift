@@ -266,8 +266,10 @@ private func notificationHandler(contextObject: UnsafeMutableRawPointer?, sessio
     return
   }
 
-  if messageType == "schema", let messageValue = messageValue, let schemaName = try? /^[^\/]*\/(.*)$/.firstMatch(in: messageValue)?.output.1 {
-    delegate.showStatusMessage(msgTextLong: String(schemaName), msgTextShort: String(schemaName))
+  if messageType == "schema" {
+    // 只有 Nova 一个方案：不报方案名，报当前是中文还是英文。
+    let label = delegate.rimeAPI.get_option(sessionId, "ascii_mode") ? "英" : "中"
+    delegate.showStatusMessage(msgTextLong: label, msgTextShort: label)
     return
   } else if messageType == "option" {
     let state = messageValue?.first != "!"

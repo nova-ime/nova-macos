@@ -51,12 +51,22 @@ struct Rect {
 struct Style {
   double size;
   bool linear, show_share;
-  double RowHeight() const { return std::ceil(size * 1.5); }
-  double ChipHeight() const { return std::ceil(size * 1.6); }
-  double AltHeight() const { return std::ceil(size * 1.5); }
+  // 主题里的形状，NovaUIStyle 里为 0 的取默认值（见 MakeStyle）。
+  double card_radius, chip_radius, edge, chip_padding, column_gap, row_height, chip_height;
+  double RowHeight() const { return std::ceil(size * row_height); }
+  double ChipHeight() const { return std::ceil(size * chip_height); }
+  double AltHeight() const { return std::ceil(size * row_height); }
   double ShareHeight() const { return show_share ? kShareRow : 0; }
   double AltRowHeight() const { return AltHeight() + (show_share ? kShareRow : kAltSpacing); }
 };
+
+Style MakeStyle(const NovaUIStyle& in) {
+  auto pick = [](double value, double fallback) { return value > 0 ? value : fallback; };
+  return {in.font_size, in.linear != 0, in.show_share != 0,
+          pick(in.card_radius, kCornerRadius), pick(in.chip_radius, kChipRadius), pick(in.edge, kEdge),
+          pick(in.chip_padding, kChipPadding), pick(in.column_gap, kColumnGap), pick(in.row_height, 1.5),
+          pick(in.chip_height, 1.6)};
+}
 
 // 一排词块的竖向坐标。d 是离词块顶边的距离；往上长时整排上下翻转。
 struct Tier {
@@ -88,7 +98,7 @@ class Layout {
  public:
   Layout(const NovaUIContent& content, const Style& style, NovaUIMeasureFn measure, void* user, double max_width,
          bool upward)
-      : s_(style), measure_(measure), user_(user), upward_(upward), bottom_(kEdge) {
+      : s_(style), measure_(measure), user_(user), upward_(upward), bottom_(style.edge) {
     card_ = content.block_count == 0;
     AddPreedit(content);
     if (content.block_count == 0) {
@@ -99,8 +109,8 @@ class Layout {
       AddTree(content, max_width);
       if (upward_) AddLetters(content);
     }
-    width_ = std::ceil(right_) + kEdge;
-    height_ = std::ceil(bottom_) + kEdge;
+    width_ = std::ceil(right_) + s_.edge;
+    height_ = std::ceil(bottom_) + s_.edge;
   }
 
   double width_ = 0, height_ = 0;
@@ -146,17 +156,17 @@ class Layout {
     if (preedit.empty()) return;
     const int length = nova::Utf16Length(preedit);
     const bool selected = content.sel_location >= 0 && content.sel_location + content.sel_length <= length;
-    Rect rect = {kEdge, bottom_, 0, s_.RowHeight()};
+    Rect rect = {s_.edge, bottom_, 0, s_.RowHeight()};
     RunStore store;
     store.text = preedit;
     store.run = {nullptr, NOVA_FONT_BODY, s_.size, selected ? NOVA_COLOR_DIM : NOVA_COLOR_PRIMARY, -1, -1,
-                 NOVA_COLOR_PRIMARY, kEdge, Baseline(rect, NOVA_FONT_BODY)};
+                 NOVA_COLOR_PRIMARY, s_.edge, Baseline(rect, NOVA_FONT_BODY)};
     if (selected) {
       store.run.hl_start = content.sel_location;
       store.run.hl_end = content.sel_location + content.sel_length;
     }
     runs_.push_back(std::move(store));
-    right_ = std::max(right_, kEdge + Width(preedit, NOVA_FONT_BODY));
+    right_ = std::max(right_, s_.edge + Width(preedit, NOVA_FONT_BODY));
     bottom_ += s_.RowHeight();
     if (content.block_count > 0 || content.candidate_count > 0) bottom_ += 6;
   }
@@ -178,10 +188,10 @@ class Layout {
     }
     const double count = static_cast<double>(letters.size());
     const double width = std::ceil(Width("m", NOVA_FONT_LETTER));
-    Rect rect = {kEdge + kChipPadding, bottom_, width * count, s_.RowHeight()};
+    Rect rect = {s_.edge + s_.chip_padding, bottom_, width * count, s_.RowHeight()};
     const double line = Baseline(rect, NOVA_FONT_LETTER);
     // 字母是白色，铺一块深色底，在浅色窗口上也看得见。
-    AddBox(boxes_, rect.InsetBy(-kChipPadding, 0), kChipRadius, NOVA_COLOR_ALT_FILL);
+    AddBox(boxes_, rect.InsetBy(-s_.chip_padding, 0), s_.chip_radius, NOVA_COLOR_ALT_FILL);
     std::set<int> covered;
     for (int i = 0; i < content.block_count; i++) {
       const int from = nova_ui_letter_position(&content, content.blocks[i].from);
@@ -205,7 +215,7 @@ class Layout {
     const int cursor_letter = std::min(std::max(nova_ui_letter_position(&content, content.cursor), 0), static_cast<int>(letters.size()));
     const double cursor_x = rect.MinX() + static_cast<double>(cursor_letter) * width;
     AddBox(boxes_, {cursor_x - 1, rect.MinY() + 3, 2, rect.h - 6}, 1, NOVA_COLOR_FOCUS);
-    right_ = std::max(right_, rect.MaxX() + kChipPadding);
+    right_ = std::max(right_, rect.MaxX() + s_.chip_padding);
     bottom_ += s_.RowHeight();
     if (!upward_) bottom_ += 6;
   }
@@ -227,7 +237,7 @@ class Layout {
     column.index = index;
     column.block = &block;
     column.chip = block.word.text ? block.word.text : "";
-    column.chip_width = std::ceil(Width(column.chip, NOVA_FONT_BODY)) + kChipPadding * 2;
+    column.chip_width = std::ceil(Width(column.chip, NOVA_FONT_BODY)) + s_.chip_padding * 2;
     if (shows) {
       for (int i = 0; i < block.alt_count; i++) column.cells.push_back(MakeAlt(block.alts[i], first_label + i));
     }
@@ -239,7 +249,7 @@ class Layout {
 
   // 词块只按自身宽度排在一条连线上，放不下时另起一排。
   void AddTree(const NovaUIContent& content, double max_width) {
-    const double limit = max_width - kEdge * 2;
+    const double limit = max_width - s_.edge * 2;
     std::vector<std::vector<Column>> tiers;
     double tier_width = 0;
     bool has_focus = false;
@@ -254,7 +264,7 @@ class Layout {
         tiers.emplace_back();
         tier_width = 0;
       }
-      tier_width += column.chip_width + kColumnGap;
+      tier_width += column.chip_width + s_.column_gap;
       tiers.back().push_back(std::move(column));
     }
     for (size_t i = 0; i < tiers.size(); i++) {
@@ -268,7 +278,7 @@ class Layout {
     for (const Column& c : columns) depth = std::max(depth, c.cells.size());
     const double alts_height = depth > 0 ? kBusGap + static_cast<double>(depth) * s_.AltRowHeight() : 0;
     const Tier tier = {bottom_, s_.ChipHeight() + s_.ShareHeight() + alts_height, upward_};
-    double x = kEdge;
+    double x = s_.edge;
     bool has_previous = false;
     double previous_end = 0;
     double alt_floor = 0;
@@ -280,11 +290,11 @@ class Layout {
                nova_ui_block_color(column.block));
       }
       AddChip(column, x, tier);
-      AddAlternatives(column, x, tier, &alt_floor);
+      AddAlternatives(column, x, tier, depth, &alt_floor);
       has_previous = true;
       previous_end = x + column.chip_width;
       right_ = std::max(right_, x + column.chip_width);
-      x += column.chip_width + kColumnGap;
+      x += column.chip_width + s_.column_gap;
     }
     bottom_ = tier.top + tier.height;
   }
@@ -292,10 +302,10 @@ class Layout {
   void AddChip(const Column& column, double x, const Tier& tier) {
     const Rect rect = tier.R(x, 0, column.chip_width, s_.ChipHeight());
     // 焦点块换底色，不用描边。
-    AddBox(boxes_, rect, kChipRadius, column.block->focused ? NOVA_COLOR_FOCUS : nova_ui_block_color(column.block));
+    AddBox(boxes_, rect, s_.chip_radius, column.block->focused ? NOVA_COLOR_FOCUS : nova_ui_block_color(column.block));
     AddHit(rect, NOVA_ACTION_FOCUS, column.index);
-    AddRun(column.chip, NOVA_FONT_BODY, column.block->focused ? NOVA_COLOR_BLACK : NOVA_COLOR_PRIMARY,
-           x + kChipPadding, Baseline(rect, NOVA_FONT_BODY));
+    AddRun(column.chip, NOVA_FONT_BODY, column.block->focused ? NOVA_COLOR_BLACK : NOVA_COLOR_CHIP_TEXT,
+           x + s_.chip_padding, Baseline(rect, NOVA_FONT_BODY));
     if (column.has_share) {
       const Rect row = tier.R(x, s_.ChipHeight(), column.chip_width, s_.ShareHeight());
       AddRun(column.share, NOVA_FONT_SHARE, NOVA_COLOR_SHARE,
@@ -310,8 +320,10 @@ class Layout {
   }
 
   // 备选放不下时往右让，用一条横线接回词块。
-  void AddAlternatives(const Column& column, double x, const Tier& tier, double* alt_floor) {
+  // 面板在光标上方时备选往上长，但编号仍从上往下读：1 在最上面，各列的 1 对齐在同一排。
+  void AddAlternatives(const Column& column, double x, const Tier& tier, size_t depth, double* alt_floor) {
     if (column.cells.empty()) return;
+    auto slot = [&](size_t row) { return tier.upward ? depth - 1 - row : row; };
     const double cell_x = std::max(x + kAltIndent, *alt_floor);
     double width = 0;
     for (const AltCell& c : column.cells) width = std::max(width, c.width);
@@ -323,7 +335,7 @@ class Layout {
     Line(spine, bus);
     for (size_t row = 0; row < column.cells.size(); row++) {
       const AltCell& cell = column.cells[row];
-      const double distance = first_row + static_cast<double>(row) * s_.AltRowHeight();
+      const double distance = first_row + static_cast<double>(slot(row)) * s_.AltRowHeight();
       const Rect rect = tier.R(cell_x, distance, width, s_.AltHeight());
       AddBranch(spine, bus, cell_x, rect.MidY());
       // ↓/↑ 换上的那一项铺蓝色，和普通列表的高亮一样。
@@ -344,7 +356,7 @@ class Layout {
     // 分页时在最后一个备选右边标出页码，-/= 或 ,/. 翻页。
     const std::string page = column.block->page ? column.block->page : "";
     if (!page.empty()) {
-      const Rect rect = tier.R(cell_x, first_row + static_cast<double>(column.cells.size() - 1) * s_.AltRowHeight(), width, s_.AltHeight());
+      const Rect rect = tier.R(cell_x, first_row + static_cast<double>(slot(column.cells.size() - 1)) * s_.AltRowHeight(), width, s_.AltHeight());
       const std::string text = "\xE2\x80\xB9 " + page + " \xE2\x80\xBA";  // ‹ 页码 ›
       AddRun(text, NOVA_FONT_LABEL, NOVA_COLOR_DIM, cell_x + width + kAltGap, Baseline(rect, NOVA_FONT_LABEL));
       right_ = std::max(right_, cell_x + width + kAltGap + std::ceil(Width(text, NOVA_FONT_LABEL)));
@@ -390,18 +402,18 @@ class Layout {
       uniform = entries[0].width;
       for (const Entry& e : entries) uniform = std::max(uniform, e.width);
     }
-    double x = kEdge;
-    const double limit = max_width - kEdge;
+    double x = s_.edge;
+    const double limit = max_width - s_.edge;
     double row_top = bottom_;
     for (size_t index = 0; index < entries.size(); index++) {
       const Entry& entry = entries[index];
       const double width = has_uniform ? uniform : entry.width;
-      if (x > kEdge && x + width > limit) {
-        x = kEdge;
+      if (x > s_.edge && x + width > limit) {
+        x = s_.edge;
         row_top += s_.RowHeight();
       }
       const Rect rect = {x, row_top, width, s_.RowHeight()};
-      if (static_cast<int>(index) == content.highlighted) AddBox(boxes_, rect, kChipRadius, NOVA_COLOR_BLUE);
+      if (static_cast<int>(index) == content.highlighted) AddBox(boxes_, rect, s_.chip_radius, NOVA_COLOR_BLUE);
       AddHit(rect, NOVA_ACTION_SELECT, static_cast<int>(index));
       const double line = Baseline(rect, NOVA_FONT_BODY);
       double cursor = x + kRowPadding;
@@ -410,7 +422,9 @@ class Layout {
         cursor += std::ceil(entry.label_width) + kLabelGap;
       }
       if (!entry.text.empty()) {
-        AddRun(entry.text, NOVA_FONT_BODY, NOVA_COLOR_PRIMARY, cursor, line);
+        // 高亮项的底色是蓝块，字用词块上的字色。
+        AddRun(entry.text, NOVA_FONT_BODY,
+               static_cast<int>(index) == content.highlighted ? NOVA_COLOR_CHIP_TEXT : NOVA_COLOR_PRIMARY, cursor, line);
         cursor += std::ceil(entry.text_width) + kLabelGap;
       }
       if (!entry.comment.empty()) {
@@ -439,7 +453,7 @@ struct NovaUILayout {
 NovaUILayout* nova_ui_layout_create(const NovaUIContent* content, const NovaUIStyle* style, NovaUIMeasureFn measure,
                                     void* user, double max_width, int upward) {
   auto* out = new NovaUILayout();
-  Style s = {style->font_size, style->linear != 0, style->show_share != 0};
+  const Style s = MakeStyle(*style);
   out->layout.reset(new Layout(*content, s, measure, user, max_width, upward != 0));
   Layout& l = *out->layout;
   for (auto& store : l.runs_) {
@@ -469,9 +483,12 @@ void nova_ui_layout_free(NovaUILayout* layout) { delete layout; }
 
 // 词块加满备选的高度，用来判断光标下方放不放得下。
 double nova_ui_full_height(const NovaUIStyle* style) {
-  Style s = {style->font_size, style->linear != 0, style->show_share != 0};
-  return kEdge * 2 + s.ChipHeight() + s.ShareHeight() + kBusGap + kMaxAlts * s.AltRowHeight();
+  const Style s = MakeStyle(*style);
+  return s.edge * 2 + s.ChipHeight() + s.ShareHeight() + kBusGap + kMaxAlts * s.AltRowHeight();
 }
 
 double nova_ui_corner_radius(void) { return kCornerRadius; }
 double nova_ui_edge(void) { return kEdge; }
+
+double nova_ui_style_corner_radius(const NovaUIStyle* style) { return MakeStyle(*style).card_radius; }
+double nova_ui_style_edge(const NovaUIStyle* style) { return MakeStyle(*style).edge; }

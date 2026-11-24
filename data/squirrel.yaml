@@ -24,7 +24,7 @@ style:
   # horizontal is Deprecated since 0.36, Squirrel 0.15, removed since 1.0.1
   candidate_list_layout: stacked  # stacked | linear
   text_orientation: horizontal  # horizontal | vertical
-  inline_preedit: true
+  inline_preedit: false  # Nova：应用里只留一个全角空格占位，按键和整句都在面板里
   # Whether to embed selected candidate as text in input field
   inline_candidate: false
   # Whether candidate panel stick to screen edge to reduce jumping

@@ -1,0 +1,36 @@
+# Nova 星语的主题。每个 .yaml 是一套主题，文件名就是主题的编号。
+# 放在用户目录的 nova_themes/ 里；改完在设置里重新选一次这个主题，或者点「重新加载设置」。
+version: 1
+name: "色弱友好（浅色）"  # 名字：设置里显示的名字
+author: "nova-ime"  # 作者
+appearance: light  # 深浅：dark 深色 / light 浅色；「跟随系统」时按它分组
+
+font:
+  face: ""  # 正文字体：空为系统字体；可写多个，逗号分隔，前面的优先
+  mono: ""  # 等宽字体：序号、字母行用；空为系统等宽字体
+  size: 15  # 字号：正文字号（点），序号和字母行按比例跟着变
+
+shape:
+  card_radius: 10  # 底板圆角：普通候选列表底板的圆角
+  chip_radius: 6  # 词块圆角：词块、备选格的圆角
+  edge: 10  # 四周留白
+  chip_padding: 8  # 词块左右留白
+  column_gap: 12  # 词块间距
+  row_height: 1.5  # 行高：行高是字号的几倍
+  chip_height: 1.6  # 词块高度：词块高是字号的几倍
+
+colors:
+  blue: "#0072b2"  # 普通词块
+  purple: "#a8508a"  # 改过的词：Nova 结合上下文改过的词
+  orange: "#c25400"  # 拿不准的词：多在打错键时出现
+  green: "#007a5a"  # 选过的词
+  chip_text: "#ffffff"  # 词块上的字
+  focus: "#f0e442"  # 焦点词块：也是字母行光标的颜色
+  focus_text: "#000000"  # 焦点上的字
+  alt_fill: "#ededed"  # 备选格：备选格、字母行的底色
+  alt_hover: "#dcdcdc"  # 悬停的备选格
+  card: "#f7f7f7"  # 列表底板：普通候选列表和状态消息的底色
+  text: "#1a1a1a"  # 文字：备选、列表里的字
+  dim: "#6b6b6b"  # 次要文字：序号、注释、没盖到的字母
+  share: "#808080"  # 词频比例
+  branch: "#9a9a9a"  # 分支线

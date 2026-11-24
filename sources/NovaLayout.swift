@@ -4,7 +4,7 @@
 //
 //  候选面板的数据和几何。这里只算要画什么、画在哪，不碰窗口。
 //  平台无关的部分（nova_tree 解析、内容组装、排版）在 nova-ui/（C++，C API 见 nova_ui.h），
-//  这个文件只是 macOS 的薄封装：提供测宽回调，把颜色语义映射成 NovaPalette，把显示列表转成 NovaView 能画的结构。
+//  这个文件只是 macOS 的薄封装：提供测宽回调，按主题（NovaTheme）把颜色语义换成颜色，把显示列表转成 NovaView 能画的结构。
 //
 
 import AppKit
@@ -69,16 +69,6 @@ struct NovaBlock: Equatable {
     return (0..<Int(count)).map { NovaBlock(blocks[$0]) }
   }
 
-  // 绿：用户选过。紫：语法推翻了词频（多半是对的）。橙：解码器拿不准。见 nova_sentences.lua 的 measure_block。
-  var color: NSColor {
-    switch tone {
-    case "green": NovaPalette.green
-    case "purple": NovaPalette.purple
-    case "orange": NovaPalette.orange
-    default: NovaPalette.blue
-    }
-  }
-
   // 颜色的名字，界面日志（NovaUILog）记这个。
   var tone: String {
     if pinned {
@@ -132,18 +122,45 @@ struct NovaContent {
 }
 
 struct NovaStyle {
-  var font = NSFont.systemFont(ofSize: 15)
+  // 颜色、字体、字号、形状都来自主题。
+  var theme = NovaTheme() {
+    didSet { updateFonts() }
+  }
   var linear = false
   // 是否在词和备选下面显示词频比例，对应 style/show_share。
   var showShare = false
 
-  var labelFont: NSFont { .monospacedDigitSystemFont(ofSize: round(font.pointSize * 0.68), weight: .medium) }
-  var shareFont: NSFont { .monospacedDigitSystemFont(ofSize: round(font.pointSize * 0.62), weight: .regular) }
-  var letterFont: NSFont { .monospacedSystemFont(ofSize: round(font.pointSize * 0.9), weight: .regular) }
+  private(set) var font = NSFont.systemFont(ofSize: 15)
+  private(set) var labelFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .medium)
+  private(set) var shareFont = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular)
+  private(set) var letterFont = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
 
-  fileprivate var cStyle: NovaUIStyle {
-    NovaUIStyle(font_size: Double(font.pointSize), linear: linear ? 1 : 0, show_share: showShare ? 1 : 0)
+  init(theme: NovaTheme = NovaTheme()) {
+    self.theme = theme
+    updateFonts()
   }
+
+  private mutating func updateFonts() {
+    let size = CGFloat(Double(theme["font/size"]) ?? 15)
+    font = NovaThemes.font(faces: theme["font/face"], size: size, fallback: .systemFont(ofSize: size))
+    let mono = theme["font/mono"]
+    func monoFont(_ scale: CGFloat, _ fallback: NSFont) -> NSFont {
+      NovaThemes.font(faces: mono, size: round(size * scale), fallback: fallback)
+    }
+    labelFont = monoFont(0.68, .monospacedDigitSystemFont(ofSize: round(size * 0.68), weight: .medium))
+    shareFont = monoFont(0.62, .monospacedDigitSystemFont(ofSize: round(size * 0.62), weight: .regular))
+    letterFont = monoFont(0.9, .monospacedSystemFont(ofSize: round(size * 0.9), weight: .regular))
+  }
+
+  var cStyle: NovaUIStyle {
+    var style = NovaUIStyle()
+    style.linear = linear ? 1 : 0
+    style.show_share = showShare ? 1 : 0
+    theme.fill(&style)
+    return style
+  }
+
+  func color(_ token: NovaUIColor) -> NSColor { theme.color(token) }
 
   fileprivate func roleFont(_ role: NovaUIFont) -> NSFont {
     switch role {
@@ -162,42 +179,6 @@ enum NovaAction: Equatable {
   case focus(Int)
   // 把原始字母光标移到第几个字母之前。
   case cursor(Int)
-}
-
-// 全部是实色，没有透明度和描边。数值和 nova-ui 的默认调色板（nova_ui_default_color）一致。
-enum NovaPalette {
-  static let blue = NSColor(srgbRed: 0x2f / 255, green: 0x6f / 255, blue: 0xde / 255, alpha: 1)
-  static let orange = NSColor(srgbRed: 0xd2 / 255, green: 0x66 / 255, blue: 0x24 / 255, alpha: 1)
-  static let purple = NSColor(srgbRed: 0x7b / 255, green: 0x48 / 255, blue: 0xd8 / 255, alpha: 1)
-  static let green = NSColor(srgbRed: 0x1f / 255, green: 0x9d / 255, blue: 0x6b / 255, alpha: 1)
-  // 焦点块要在深浅窗口上都醒目，白色和黑色都不行。
-  static let focus = NSColor(srgbRed: 0xf5 / 255, green: 0xc5 / 255, blue: 0x18 / 255, alpha: 1)
-  static let altFill = NSColor(white: 0.16, alpha: 1)
-  static let altHover = NSColor(white: 0.28, alpha: 1)
-  static let card = NSColor(white: 0.13, alpha: 1)
-  static let branch = NSColor(white: 0.55, alpha: 1)
-  static let primary = NSColor.white
-  static let dim = NSColor(white: 0.62, alpha: 1)
-  static let share = NSColor(white: 0.5, alpha: 1)
-
-  // nova-ui 的颜色语义 -> 这里的颜色。
-  fileprivate static func color(_ token: NovaUIColor) -> NSColor {
-    switch token {
-    case NOVA_COLOR_BLUE: blue
-    case NOVA_COLOR_ORANGE: orange
-    case NOVA_COLOR_PURPLE: purple
-    case NOVA_COLOR_GREEN: green
-    case NOVA_COLOR_FOCUS: focus
-    case NOVA_COLOR_ALT_FILL: altFill
-    case NOVA_COLOR_ALT_HOVER: altHover
-    case NOVA_COLOR_CARD: card
-    case NOVA_COLOR_BRANCH: branch
-    case NOVA_COLOR_PRIMARY: primary
-    case NOVA_COLOR_DIM: dim
-    case NOVA_COLOR_SHARE: share
-    default: .black
-    }
-  }
 }
 
 // 测宽回调要带的上下文：每个字体角色对应的字体。
@@ -284,6 +265,8 @@ struct NovaLayout {
     let rect: NSRect
     let radius: CGFloat
     let color: NSColor
+    // 备选格要知道自己是备选格，鼠标悬停时换成 alt_hover。
+    let token: NovaUIColor
   }
   struct Run {
     let string: NSAttributedString
@@ -295,8 +278,8 @@ struct NovaLayout {
     let action: NovaAction
   }
 
-  static let cornerRadius = CGFloat(nova_ui_corner_radius())
-  static let edge = CGFloat(nova_ui_edge())
+  // 底板、分支线、悬停的颜色和底板圆角，画的时候用。
+  let style: NovaStyle
 
   private(set) var size = NSSize.zero
   // 只有普通列表和状态消息有底色；树直接浮在文字下方，没有边缘可以跳动。
@@ -309,6 +292,7 @@ struct NovaLayout {
 
   // 放在光标上方时，词块贴着光标，备选往上长。
   init(content: NovaContent, style: NovaStyle, maxWidth: CGFloat, upward: Bool) {
+    self.style = style
     let source = NovaCContent(content)
     var cStyle = style.cStyle
     let measurer = NovaMeasurer(style: style)
@@ -320,7 +304,7 @@ struct NovaLayout {
     size = NSSize(width: view.width, height: view.height)
     card = view.card != 0
     func rect(_ rect: NovaUIRect) -> NSRect { NSRect(x: rect.x, y: rect.y, width: rect.width, height: rect.height) }
-    func box(_ box: NovaUIBox) -> Box { Box(rect: rect(box.rect), radius: box.radius, color: NovaPalette.color(box.color)) }
+    func box(_ box: NovaUIBox) -> Box { Box(rect: rect(box.rect), radius: box.radius, color: style.color(box.color), token: box.color) }
     links = (0..<Int(view.link_count)).map { box(view.links[$0]) }
     boxes = (0..<Int(view.box_count)).map { box(view.boxes[$0]) }
     for index in 0..<Int(view.path_count) {
@@ -338,9 +322,9 @@ struct NovaLayout {
     runs = (0..<Int(view.run_count)).map { index in
       let run = view.runs[index]
       let text = NSMutableAttributedString(string: String(cString: run.text),
-                                           attributes: [.font: style.roleFont(run.font), .foregroundColor: NovaPalette.color(run.color)])
+                                           attributes: [.font: style.roleFont(run.font), .foregroundColor: style.color(run.color)])
       if run.hl_start >= 0 {
-        text.addAttribute(.foregroundColor, value: NovaPalette.color(run.hl_color), range: NSRange(location: Int(run.hl_start), length: Int(run.hl_end - run.hl_start)))
+        text.addAttribute(.foregroundColor, value: style.color(run.hl_color), range: NSRange(location: Int(run.hl_start), length: Int(run.hl_end - run.hl_start)))
       }
       return Run(string: text, x: run.x, baseline: run.baseline)
     }
@@ -360,6 +344,16 @@ struct NovaLayout {
   static func fullHeight(style: NovaStyle) -> CGFloat {
     var cStyle = style.cStyle
     return CGFloat(nova_ui_full_height(&cStyle))
+  }
+
+  static func edge(style: NovaStyle) -> CGFloat {
+    var cStyle = style.cStyle
+    return CGFloat(nova_ui_style_edge(&cStyle))
+  }
+
+  var cornerRadius: CGFloat {
+    var cStyle = style.cStyle
+    return CGFloat(nova_ui_style_corner_radius(&cStyle))
   }
 }
 

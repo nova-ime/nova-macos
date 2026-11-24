@@ -24,12 +24,14 @@ done
 scripts/fetch-model.sh
 LM="${NOVA_LM_DIR:-nova-lm/model}"
 (cd "$SS" && rm -rf build bopomofo* cangjie5* luna_* pinyin.yaml stroke* terra_* zhuyin.yaml essay.txt ./*.gram \
-  installation.yaml user.yaml lua nova_lm nova_aux)
+  installation.yaml user.yaml lua nova_lm nova_aux nova_themes)
 cp nova-schema/nova.schema.yaml nova-schema/default.yaml nova-schema/symbols.yaml nova-schema/symbols.custom.yaml \
   nova-schema/nova_lexicon.txt nova-schema/nova_quanpin.txt nova-schema/nova_shuangpin.txt nova-schema/nova_rare.txt \
   "$DICT/nova_wx.dict.yaml" "$DICT/nova_wx_jp.dict.yaml" "$SS/"
-mkdir -p "$SS/lua" "$SS/nova_lm" "$SS/nova_aux"
+mkdir -p "$SS/lua" "$SS/nova_lm" "$SS/nova_aux" "$SS/nova_themes"
 cp nova-schema/lua/*.lua "$SS/lua/"
+# 自带主题（sources/NovaTheme.swift 读）。Windows 安装包带的是同一份。
+cp nova-ui/themes/*.yaml "$SS/nova_themes/"
 # 换辅助码用的数据（sources/NovaAuxGen.swift 读）：词条表用 xz 压缩（39 MB → 11 MB），
 # NSData.decompressed(using: .lzma) 能直接解。自然码的表不用带：自然码用预编译的词库。
 python3 -I -c 'import lzma, sys; open(sys.argv[2], "wb").write(lzma.compress(open(sys.argv[1], "rb").read(), check=lzma.CHECK_CRC32, preset=9))' \

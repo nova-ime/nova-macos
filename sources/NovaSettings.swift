@@ -85,18 +85,19 @@ final class NovaSettingsWindow: NSObject, NSWindowDelegate {
 }
 
 struct NovaSettingsView: View {
-  enum Tab: Hashable { case layout, options, help, advanced }
+  enum Tab: Hashable { case layout, options, appearance, help, advanced }
   @State var tab: Tab
 
   var body: some View {
     TabView(selection: $tab) {
       LayoutTab().tabItem { Text("输入方式") }.tag(Tab.layout)
       OptionsTab().tabItem { Text("选项") }.tag(Tab.options)
+      NovaAppearanceTab().tabItem { Text("外观") }.tag(Tab.appearance)
       HelpTab().tabItem { Text("使用说明") }.tag(Tab.help)
       AdvancedTab().tabItem { Text("高级") }.tag(Tab.advanced)
     }
     .padding(16)
-    .frame(width: 560, height: 520)
+    .frame(width: 600, height: 560)
   }
 }
 
