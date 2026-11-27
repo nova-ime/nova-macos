@@ -1,7 +1,8 @@
 # Rime schema
 # encoding: utf-8
 #
-# 自然码双拼整句输入。辅助码只认大写：niRE 是「你」，nire 是「ni re」两个音节。
+# 自然码双拼整句输入。辅助码用大写：niRE 是「你」，nire 是「ni re」两个音节。
+# 也可以先按反引号再打小写：ni`re 和 niRE 一样（lua/nova_aux_keys.lua）。
 # 词库和语法模型来自万象拼音（CC-BY-4.0，https://github.com/amzxyz/rime-wanxiang）：
 # zrm-fuzhu 词库由 scripts/wanxiang/setup-wanxiang.sh 转成 `音节;辅助码` 编码的 nova_wx，外加一张简拼表 nova_wx_jp。
 # 1898 句评测（.scratch/bench）里，整句正确率比墨奇词库＋八股文模型高约 15 个百分点。
@@ -28,6 +29,8 @@ engine:
     - ascii_composer
     - recognizer
     - key_binder
+    # 反引号加两个小写字母等于大写辅助码：ni`re 就是 niRE。
+    - lua_processor@*nova_aux_keys
     - lua_processor@*nova_quanpin
     - lua_processor@*nova_tree_keys
     - speller
