@@ -230,12 +230,23 @@ final class SquirrelInputController: IMKInputController {
     self.client ?= sender as? IMKTextInput
     // print("[DEBUG] commitComposition: \(sender ?? "nil")")
     //  commit raw input
+    // Nova: 全拼时 Rime 的输入是换算后的双拼码（带简拼通配符 V），用户没打过。
+    // 这时上屏 nova_qp_raw，也就是用户打的拼音（lua/nova_quanpin.lua 写入，不是全拼时为空）。
+    // 切到别的应用、点通知这类情况都会走到这里。
     if session != 0 {
       if let input = rimeAPI.get_input(session) {
-        commit(string: String(cString: input))
+        let raw = rimeProperty("nova_qp_raw") ?? ""
+        commit(string: raw.isEmpty ? String(cString: input) : raw)
         rimeAPI.clear_composition(session)
       }
     }
+  }
+
+  // 读 Rime 上下文的属性。没有这个属性，或者 4096 字节放不下时返回 nil。
+  private func rimeProperty(_ name: String) -> String? {
+    var buffer = [CChar](repeating: 0, count: 4096)
+    guard rimeAPI.get_property(session, name, &buffer, buffer.count), buffer[buffer.count - 1] == 0 else { return nil }
+    return String(cString: buffer)
   }
 
   // 菜单栏的 Nova 菜单：输入方式（单选）、设置、重新加载设置。
