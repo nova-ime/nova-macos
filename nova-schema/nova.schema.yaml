@@ -23,6 +23,21 @@ switches:
   # 输入方式。内部始终是自然码双拼：全拼和别家双拼都在 lua/nova_quanpin.lua 换成自然码，其余照双拼工作。
   - options: [zrm, flypy, mspy, sogou, quanpin]
     states: [自然码, 小鹤, 微软, 搜狗, 全拼]
+  # 全拼没打完的音节也参与候选（m、muq、zhon）。默认关，设置里打开。
+  - name: quanpin_partial
+    states: [关, 开]
+  # 全拼模糊音（只在全拼开关打开时生效）。nova_quanpin.lua 给音节附上同字节长的变体码，
+  # nova_sentences.lua 查询时合并；开关在设置面板里改，默认关。
+  - name: fuzzy_zcs
+    states: [关, 开]
+  - name: fuzzy_nasal
+    states: [关, 开]
+  - name: fuzzy_nl
+    states: [关, 开]
+  - name: fuzzy_fh
+    states: [关, 开]
+  - name: fuzzy_rl
+    states: [关, 开]
 
 engine:
   processors:

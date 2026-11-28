@@ -14,6 +14,14 @@ local CACHE_LIMIT = 2000
 -- 它占的位置和完整音节一样宽，后面不跟辅助码。
 local WILDCARD = "V"
 
+-- 模糊音的备选由 nova_quanpin 写在 nova_qp_alt：`码:变体,罚分|变体,罚分;...`。
+-- 罚分和 log(quality) 同一量纲；同码变体的码长和主码相同，替换后位置不用换算。
+local FUZZY_COST = 2.5
+local FUZZY_WORDS_PER_SPAN = 4
+local MAX_FUZZY_VARIANTS = 4   -- 含基础键
+local MAX_FUZZY_SYLLABLES = 3  -- 更长的 span 不展开变体，控制每键查询量
+local PARTIAL_OVERVIEW_ALTS = 4  -- 末尾没打完的块先显示几个备选
+
 -- 这段编码里有没有辅助码。简拼音节里的通配符是大写字母，但不是辅助码。
 local function has_aux(code)
     local pos = 1
@@ -31,19 +39,164 @@ local function has_aux(code)
     return false
 end
 
--- 返回完整音节和结尾没打完的单个字母。没打完的字母不参与解码，词块也就不会每敲一键变一次。
-local function syllables(input)
+-- 返回音节 token 和结尾没打完的字母。全拼（allow_partial）时把末尾单个字母也当一个 token，
+-- 由 nova_qp_pend 标记区分它是不是待定音节；双拼仍不把没打完的字母算进来。
+local function syllables(input, allow_partial, pend_len)
     local tokens, pos = {}, 1
     while pos <= #input do
         local token = input:match("^[a-z][a-z][A-Z]?[A-Z]?", pos) or input:match("^[a-z]" .. WILDCARD, pos)
         if not token then
             local pending = input:match("^[a-z]$", pos)
-            return pending and tokens or nil, pending or ""
+            -- 全拼的 1 字节末尾只能是待定音节，不需要等 nova_qp_pend 同步。
+            if pending and allow_partial then
+                tokens[#tokens + 1] = pending
+                return tokens, pending, true
+            end
+            return pending and tokens or nil, pending or "", false
         end
         tokens[#tokens + 1] = token
         pos = pos + #token
     end
-    return tokens, ""
+    -- 2 字节码要靠 nova_qp_pend 才知道是“完整音节”还是“猜出来的待定音节”；
+    -- 1 字节码本身就是待定（上面已经返回）。标记里的输入长度校验在 func 里做。
+    local partial = allow_partial and pend_len and pend_len == 2 and #tokens > 0
+        and #tokens[#tokens] == 2
+    return tokens, "", partial or false
+end
+
+-- nova_qp_alt 解析成 { [码] = { {code=变体, cost=罚分}, ... } }。
+local function parse_alt(value)
+    local alt = {}
+    for entry in value:gmatch("[^;]+") do
+        local code, list = entry:match("^([^:]+):(.*)$")
+        if code then
+            local items = {}
+            for item in list:gmatch("[^|]+") do
+                local altcode, cost = item:match("^([^,]+),([%d%.]+)$")
+                if not altcode then altcode, cost = item, nil end
+                if altcode and altcode ~= code then
+                    items[#items + 1] = { code = altcode, cost = tonumber(cost) or FUZZY_COST }
+                end
+            end
+            if #items > 0 then alt[code] = items end
+        end
+    end
+    return alt
+end
+
+-- 把一串内部码重新切成 token（2 字节音节 + 辅助码，或末尾 1 字节待定音节）。
+local function code_tokens(code)
+    local out, pos = {}, 1
+    while pos <= #code do
+        local token = code:match("^[a-z][a-z][A-Z]?[A-Z]?", pos) or code:match("^[a-z]" .. WILDCARD, pos)
+        if token then
+            out[#out + 1] = token
+            pos = pos + #token
+        else
+            local one = code:match("^[a-z]$", pos)
+            if not one then return nil end
+            out[#out + 1] = one
+            pos = pos + 1
+        end
+    end
+    return out
+end
+
+local function token_alts(env, token)
+    -- 辅助码和简拼不参与模糊音（v1）：变体只换前两个字节，带大写后缀的码先不做。
+    if #token > 2 or token:sub(2, 2) == WILDCARD then return nil end
+    return env.alt and env.alt[token]
+end
+
+-- 一组 token 的基础键和变体键。变体只替换 1~2 个音节，按罚分排序、去重、限量。
+local function variant_keys(env, list)
+    if not env.alt_prop or env.alt_prop == "" or #list > MAX_FUZZY_SYLLABLES then return nil end
+    local options, any = {}, false
+    for i, token in ipairs(list) do
+        local alts = token_alts(env, token)
+        if alts and #alts > 0 then
+            options[i] = alts
+            any = true
+        end
+    end
+    if not any then return nil end
+    local base = table.concat(list)
+    local variants = { { key = base, cost = 0 } }
+    local function add(replacements, cost)
+        if #variants >= MAX_FUZZY_VARIANTS + 8 then return end
+        local parts = {}
+        for i, token in ipairs(list) do parts[i] = replacements[i] or token end
+        variants[#variants + 1] = { key = table.concat(parts), cost = cost }
+    end
+    for i, alts in pairs(options) do
+        for _, alt in ipairs(alts) do
+            if #alt.code == #list[i] then add({ [i] = alt.code }, alt.cost) end
+        end
+    end
+    for i = 1, #list do
+        for j = i + 1, #list do
+            if options[i] and options[j] then
+                for _, a in ipairs(options[i]) do
+                    for _, b in ipairs(options[j]) do
+                        if #a.code == #list[i] and #b.code == #list[j] then
+                            add({ [i] = a.code, [j] = b.code }, a.cost + b.cost)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    table.sort(variants, function(a, b)
+        if a.cost ~= b.cost then return a.cost < b.cost end
+        return a.key < b.key
+    end)
+    local out, seen = {}, {}
+    for _, variant in ipairs(variants) do
+        if not seen[variant.key] then
+            seen[variant.key] = true
+            out[#out + 1] = variant
+            if #out >= MAX_FUZZY_VARIANTS then break end
+        end
+    end
+    return #out > 1 and out or nil
+end
+
+local function span_variants(env, tokens, first, last)
+    local list = {}
+    for i = first, last do list[#list + 1] = tokens[i] end
+    return variant_keys(env, list)
+end
+
+local function span_variants_for_key(env, key)
+    local list = code_tokens(key)
+    return list and variant_keys(env, list) or nil
+end
+
+local function span_has_alt(env, tokens, first, last)
+    if not env.alt_prop or env.alt_prop == "" then return false end
+    for i = first, last do
+        if token_alts(env, tokens[i]) then return true end
+    end
+    return false
+end
+
+-- 只有会真正生成变体的短段才绕开首选整句。
+local function fuzzy_readable(env, tokens, first, last)
+    return last - first + 1 <= MAX_FUZZY_SYLLABLES and span_has_alt(env, tokens, first, last)
+end
+
+-- 同一段码在不同输入状态（待定猜测 vs 完整音节）下备选不同，缓存键要带上备选签名。
+local function alt_signature(env, key)
+    if not env.alt_prop or env.alt_prop == "" then return "" end
+    local list = code_tokens(key)
+    if not list then return "" end
+    local parts = {}
+    for _, token in ipairs(list) do
+        for _, alt in ipairs(token_alts(env, token) or {}) do
+            parts[#parts + 1] = string.format("%s,%.1f", alt.code, alt.cost)
+        end
+    end
+    return table.concat(parts, "|")
 end
 
 -- 翻译器给的 quality 不只看查询串：librime 用整个输入框的长度做分母
@@ -51,7 +204,7 @@ end
 -- 同一段查询，输入框多打一个字母，分数的基数就变了。所以缓存的键要带上输入框长度，
 -- 不然整句解码会把不同时刻查到的分数加在一起，结果取决于之前缓存了什么。
 local function cache_key(env, key)
-    return #env.engine.context.input .. ":" .. key
+    return #env.engine.context.input .. ":" .. key .. "|" .. alt_signature(env, key)
 end
 
 -- 翻译器查一段码的结果，按输入框长度现算 quality。
@@ -135,7 +288,7 @@ local function words_from(env, tokens, first)
         ends[offset] = i - first + 1
     end
     local length = #env.engine.context.input
-    local by_end = {}
+    local by_end, seen, exact = {}, {}, {}
     local raw = raw_words(env, key)
     -- 保持翻译器给的顺序：它不是严格按 quality 排的（用户词优先、同权重按词典顺序），
     -- 重排会换掉前 WORDS_PER_SPAN 个里的词。
@@ -144,8 +297,44 @@ local function words_from(env, tokens, first)
         if count and not word[6] then
             local quality = quality_now(raw, word, length)
             local out = by_end[count]
-            if not out then out = {}; by_end[count] = out end
-            if quality > 0 and #out < WORDS_PER_SPAN then out[#out + 1] = { word[1], math.log(quality) } end
+            if not out then out = {}; by_end[count] = out; seen[count] = {}; exact[count] = {} end
+            if quality > 0 and #out < WORDS_PER_SPAN and not seen[count][word[1]] then
+                local item = { word[1], math.log(quality) }
+                seen[count][word[1]] = item
+                exact[count][word[1]] = true
+                out[#out + 1] = item
+            end
+        end
+    end
+    -- 模糊/补全变体排在精确音之后，同文字去重、每个音节数最多留 FUZZY_WORDS_PER_SPAN 个。
+    local variants = span_variants(env, tokens, first, last)
+    if variants then
+        local fuzzy = {}
+        for vi = 2, #variants do
+            local variant = variants[vi]
+            local vraw = raw_words(env, variant.key)
+            for _, word in ipairs(vraw.list) do
+                local count = ends[word[2]]
+                if count and not word[6] then
+                    local quality = quality_now(vraw, word, length)
+                    if quality > 0 then
+                        local out = by_end[count]
+                        if not out then out = {}; by_end[count] = out; seen[count] = {}; exact[count] = {} end
+                        if not exact[count][word[1]] then
+                            local item = seen[count][word[1]]
+                            local score = math.log(quality) - variant.cost
+                            if item then
+                                if score > item[2] then item[2] = score end
+                            elseif (fuzzy[count] or 0) < FUZZY_WORDS_PER_SPAN then
+                                local added = { word[1], score }
+                                seen[count][word[1]] = added
+                                out[#out + 1] = added
+                                fuzzy[count] = (fuzzy[count] or 0) + 1
+                            end
+                        end
+                    end
+                end
+            end
         end
     end
     for count, out in pairs(by_end) do
@@ -244,28 +433,40 @@ local function offsets_end(tokens, k)
     return at
 end
 
--- 单独解码 tokens[first..last]，优先用翻译器的整句（带语法模型）。
-local function decode(env, tokens, first, last)
-    local key = table.concat(tokens, "", first, last)
-    local want = last - first + 1
+-- 翻译器对这段码的第一个完整候选（带语法模型）。没有时返回 nil。
+local function translated(env, key, want, prefix, limit)
     local seg = Segment(0, #key)
     seg.tags = Set { "abc" }
     local translation = env.translator:query(key, seg)
     if translation then
         local nxt, this = translation:iter()
-        for _ = 1, 20 do
+        for _ = 1, limit or 20 do
             local cand = nxt(this)
             if not cand then break end
-            if cand._end == #key and utf8.len(cand.text) == want then
+            if cand._end == #key and utf8.len(cand.text) == want
+                and (not prefix or cand.text:sub(1, #prefix) == prefix) then
                 return cand.text
             end
         end
+    end
+end
+
+-- 单独解码 tokens[first..last]。没有模糊变体时优先用翻译器的整句（带语法模型）；
+-- 有变体时先按合并后的词频 beam 选，模糊读法才有机会成为块文字。
+local function decode(env, tokens, first, last)
+    local key = table.concat(tokens, "", first, last)
+    local want = last - first + 1
+    local fuzzy = fuzzy_readable(env, tokens, first, last)
+    if not fuzzy then
+        local text = translated(env, key, want)
+        if text then return text end
     end
     local sub = {}
     for i = first, last do sub[#sub + 1] = tokens[i] end
     for _, path in ipairs(sentences(env, sub)) do
         if utf8.len(path[1]) == want then return path[1] end
     end
+    if fuzzy then return translated(env, key, want) end
     return nil
 end
 
@@ -274,18 +475,10 @@ end
 local function decode_after(env, tokens, first, last, prefix)
     local key = table.concat(tokens, "", first, last)
     local want = last - first + 1
-    local seg = Segment(0, #key)
-    seg.tags = Set { "abc" }
-    local translation = env.translator:query(key, seg)
-    if translation then
-        local nxt, this = translation:iter()
-        for _ = 1, 100 do
-            local cand = nxt(this)
-            if not cand then break end
-            if cand._end == #key and utf8.len(cand.text) == want and cand.text:sub(1, #prefix) == prefix then
-                return cand.text:sub(#prefix + 1)
-            end
-        end
+    local fuzzy = fuzzy_readable(env, tokens, first, last)
+    if not fuzzy then
+        local text = translated(env, key, want, prefix, 100)
+        if text then return text:sub(#prefix + 1) end
     end
     local sub = {}
     for i = first, last do sub[#sub + 1] = tokens[i] end
@@ -293,6 +486,10 @@ local function decode_after(env, tokens, first, last, prefix)
         if utf8.len(path[1]) == want and path[1]:sub(1, #prefix) == prefix then
             return path[1]:sub(#prefix + 1)
         end
+    end
+    if fuzzy then
+        local text = translated(env, key, want, prefix, 100)
+        if text then return text:sub(#prefix + 1) end
     end
     return nil
 end
@@ -311,14 +508,36 @@ local function span_weights(env, key, want)
         if word[2] == #key and utf8.len(word[1]) == want then
             local quality = quality_now(raw, word, length)
             lowest = math.min(lowest, quality)
-            if count < WORDS_PER_SPAN then
+            if count < WORDS_PER_SPAN and not top[word[1]] then
                 top[word[1]] = quality
                 count = count + 1
             end
         end
     end
+    if lowest == math.huge then lowest = 0 end
+    local variants = span_variants_for_key(env, key)
+    if variants then
+        local fuzzy = 0
+        for vi = 2, #variants do
+            local variant = variants[vi]
+            local vraw = raw_words(env, variant.key)
+            for _, word in ipairs(vraw.list) do
+                if word[4] > 100 then break end
+                if word[2] == #variant.key and utf8.len(word[1]) == want and not top[word[1]] then
+                    local quality = quality_now(vraw, word, length) * math.exp(-variant.cost)
+                    if quality > 0 and fuzzy < FUZZY_WORDS_PER_SPAN then
+                        top[word[1]] = quality
+                        fuzzy = fuzzy + 1
+                    end
+                end
+            end
+        end
+    end
     local weights = {}
-    for text, quality in pairs(top) do weights[text] = quality - lowest end
+    for text, quality in pairs(top) do
+        local weight = quality - lowest
+        if weight > 0 then weights[text] = weight end
+    end
     env.weights[slot] = weights
     return weights
 end
@@ -526,6 +745,8 @@ local function build_blocks(env, tokens, pins, default_text, spans, redecode)
             -- 才单独解码这一段。首选和前面的固定段对不上时（用户改了那里的字），
             -- 带着固定段一起解码，后面的字才能跟它组词。
             local text, from_default
+            -- 始终优先用引擎首选整句的字（带语法模型）。模糊音的读法通过备选和后面的
+            -- GPT-2 repick 参与，不在这里用词频 beam 顶掉首选，免得正常打字被改坏。
             if redecode and i <= redecode.last and stop >= redecode.first then
                 text = decode(env, tokens, i, stop)
             elseif default_text and not (before and char_sub(default_text, before.first, i - 1) ~= before.text) then
@@ -595,11 +816,25 @@ local function alternatives(env, tokens, offsets, block, cursor_syllable)
 end
 
 -- key 这段编码下长度为 want 的词，按翻译器的顺序，最多 limit 个。翻页时用，比 words_from 深。
+-- 模糊变体的词接在精确音后面，同文字去重。
 local function span_words(env, key, want, limit)
-    local words = {}
-    for _, word in ipairs(raw_words(env, key).list) do
-        if word[4] > limit * 3 or #words >= limit then break end
-        if word[2] == #key and utf8.len(word[1]) == want then words[#words + 1] = word[1] end
+    local words, seen = {}, {}
+    local function add(list, keylen)
+        for _, word in ipairs(list) do
+            if #words >= limit or word[4] > limit * 3 then return end
+            if word[2] == keylen and utf8.len(word[1]) == want and not seen[word[1]] then
+                seen[word[1]] = true
+                words[#words + 1] = word[1]
+            end
+        end
+    end
+    add(raw_words(env, key).list, #key)
+    local variants = span_variants_for_key(env, key)
+    if variants then
+        for vi = 2, #variants do
+            local variant = variants[vi]
+            add(raw_words(env, variant.key).list, #variant.key)
+        end
     end
     return words
 end
@@ -698,9 +933,22 @@ local function measure_block(env, block, tokens)
 end
 
 -- 编号不够时，让最不确定的块先拿到，每块要么全有要么没有：橙的先，窗口不一致多的先，然后是紫的。
-local function pick_overview(env, blocks, tokens, offsets)
-    -- 辅助码筛完还剩几个字的块：编号全给它，按词库顺序列出，别的块这时不给备选。
+-- 末尾没打完的块最优先：用户这会儿就在打它。
+local function pick_overview(env, blocks, tokens, offsets, partial)
     local labels = 0
+    if partial and #blocks > 0 then
+        local block = blocks[#blocks]
+        if block.last == #tokens and not block.overview then
+            local alts = alternatives(env, tokens, offsets, block)
+            for i = #alts, PARTIAL_OVERVIEW_ALTS + 1, -1 do alts[i] = nil end
+            if #alts > 0 then
+                block.overview = alts
+                labels = labels + #alts
+            end
+        end
+    end
+    -- 辅助码筛完还剩几个字的块：编号全给它，按词库顺序列出，别的块这时不给备选。
+    local aux_labels = 0
     for _, block in ipairs(blocks) do
         if block.aux_words then
             local last = block.last
@@ -714,9 +962,10 @@ local function pick_overview(env, blocks, tokens, offsets)
             end
             if #alts > 0 then block.overview = alts end
             labels = labels + #alts
+            aux_labels = aux_labels + #alts
         end
     end
-    if labels > 0 then return end
+    if aux_labels > 0 then return end
     local uncertain = {}
     for _, block in ipairs(blocks) do
         if block.uncertain or block.corrected then
@@ -729,11 +978,13 @@ local function pick_overview(env, blocks, tokens, offsets)
         return (a.share or 100) < (b.share or 100)
     end)
     for _, block in ipairs(uncertain) do
-        local alts = alternatives(env, tokens, offsets, block)
-        for i = #alts, OVERVIEW_ALTS + 1, -1 do alts[i] = nil end
-        if #alts > 0 and labels + #alts <= MAX_LABELS then
-            block.overview = alts
-            labels = labels + #alts
+        if not block.overview then
+            local alts = alternatives(env, tokens, offsets, block)
+            for i = #alts, OVERVIEW_ALTS + 1, -1 do alts[i] = nil end
+            if #alts > 0 and labels + #alts <= MAX_LABELS then
+                block.overview = alts
+                labels = labels + #alts
+            end
         end
     end
 end
@@ -760,9 +1011,20 @@ local function page_of(env)
     return tonumber(page) or 0
 end
 
-local function serialize(env, blocks, tokens, offsets, focus, ages, cursor_syllable)
+-- 树里的键：末尾待定音节写成「首字母 + V」（qV / vV），nova_lm 能按简拼音节解析。
+local function display_key(tokens, first, last, partial)
+    local parts = {}
+    for i = first, last do
+        local token = tokens[i]
+        if partial and i == #tokens then token = token:sub(1, 1) .. WILDCARD end
+        parts[#parts + 1] = token
+    end
+    return table.concat(parts)
+end
+
+local function serialize(env, blocks, tokens, offsets, focus, ages, cursor_syllable, partial)
     for _, block in ipairs(blocks) do measure_block(env, block, tokens) end
-    pick_overview(env, blocks, tokens, offsets)
+    pick_overview(env, blocks, tokens, offsets, partial)
     local lines = {}
     for i, block in ipairs(blocks) do
         local flags = block.pinned and "1" or "0"
@@ -775,7 +1037,7 @@ local function serialize(env, blocks, tokens, offsets, focus, ages, cursor_sylla
         local from, to = offsets[block.first], offsets[block.last] + #tokens[block.last]
         flags = flags .. "a" .. (ages[from .. ":" .. to .. ":" .. block.text] or 0)
         local fields = { flags, tostring(offsets[block.first]), tostring(offsets[block.last] + #tokens[block.last]),
-                         block.key, field(block.text, block.share) }
+                         display_key(tokens, block.first, block.last, partial), field(block.text, block.share) }
         local alts = block.overview or {}
         if i == focus then
             -- 焦点块的备选按页给出，每页 MAX_ALTS 个；页码越界时收到最后一页。
@@ -828,8 +1090,8 @@ end
 --   用户选过的块（nova_pins 里的 h）；
 --   学到的切分（nova_bounds，见 apply_bounds）：上一次用上的左右两块接着保留（最后一块也是），
 --   免得后面的字把它并进更长的词（报道 + 查 → 道查）；
---   输入没变时（移动焦点、选词后刷新），或者只多了一个没打完的字母，整棵树原样保留，
---   不然同一个输入会来回跳，半个音节也会让前面的词闪一下。
+--   输入没变时（移动焦点、选词后刷新）整棵树原样保留，不然同一个输入会来回跳。
+--   全拼多打一个没打完的字母也会重新解码，让待定音节的补全候选跟着出现。
 
 -- 上一次的树：每块的字段和它已经稳定了几个音节（标记里的数字，现在只供 nova_lm 合并人名用）。
 local function previous_blocks(previous)
@@ -859,14 +1121,19 @@ local function learned_blocks(used)
 end
 
 -- open_from 是刚选的词的起点：它后面的块不再原样保留，跟着新选的字重新解码。
-local function frozen_lines(previous, same_input, open_from, bounds_used)
+-- 固定段的键要用真实输入字节（input 子串），不能用树里的显示键：待定音节显示成 qV，
+-- 实际输入只有 q，parse_pins 按 input:sub(...) 校验。
+local function frozen_lines(previous, same_input, open_from, bounds_used, input)
     local lines = {}
     local learned = learned_blocks(bounds_used)
     for i, block in ipairs(previous) do
         local settled = learned[block.from .. ":" .. block.to .. ":" .. block.key]
         local opened = open_from and tonumber(block.to) > open_from
+        local from, to = tonumber(block.from), tonumber(block.to)
+        local key = block.key
+        if input and from and to and to <= #input then key = input:sub(from + 1, to) end
         if (same_input or settled) and not opened then
-            lines[#lines + 1] = string.format("%s:%s:%s:s:%s\n", block.from, block.to, block.key, block.text)
+            lines[#lines + 1] = string.format("%s:%s:%s:s:%s\n", block.from, block.to, key, block.text)
         end
     end
     return table.concat(lines)
@@ -971,7 +1238,7 @@ local function apply_bounds(blocks, tokens, offsets)
 end
 
 -- 返回 nova_tree 属性，以及要替换首选时的新候选。
-local function build_tree(env, tokens, seg, cand, stop)
+local function build_tree(env, tokens, seg, cand, stop, partial)
     local context = env.engine.context
     local offsets = token_offsets(tokens)
     local same_input = context:get_property("nova_tree_input") == context.input
@@ -982,9 +1249,10 @@ local function build_tree(env, tokens, seg, cand, stop)
     -- 只用这一次。不清掉的话，后面的块每次移动光标都重新解码；nova_lm_filter 重选首选时不动焦点块，
     -- 焦点移上去文字就变回解码器的写法，移开又变回去。
     if open_from then context:set_property("nova_open_from", "") end
+    local input = context.input:sub(seg._start + 1, seg._end)
     local frozen = frozen_lines(previous, same_input or stop ~= seg._end, open_from,
-                                context:get_property("nova_bounds_used"))
-    local pins = parse_pins(env, tokens, offsets, context.input:sub(seg._start + 1, seg._end), frozen)
+                                context:get_property("nova_bounds_used"), input)
+    local pins = parse_pins(env, tokens, offsets, input, frozen)
     local default_text = utf8.len(cand.text) == #tokens and cand.text or nil
     local spans = default_text and decoder_spans(cand, tokens)
     -- nova_redecode：`起:止:输入`，nova_tree_keys 伸缩块时写，输入变了就失效。
@@ -1010,11 +1278,12 @@ local function build_tree(env, tokens, seg, cand, stop)
     end
     choose_by_aux(env, blocks, tokens, offsets)
     local focus, cursor_syllable = focused_index(env, blocks, offsets, tokens, seg)
-    -- 没打完的字母不算，只在多了完整音节时加一。
-    local grew = not same_input and stop == seg._end
-    local tree = serialize(env, blocks, tokens, offsets, focus, block_ages(previous, grew and 1 or 0), cursor_syllable)
+    -- 没打完的音节不算稳定，只在完成音节时加一。
+    local grew = not same_input and not partial and stop == seg._end
+    local tree = serialize(env, blocks, tokens, offsets, focus, block_ages(previous, grew and 1 or 0),
+                           cursor_syllable, partial)
     if not (next(pins) or env.tree_debug or top_text(blocks) ~= cand.text) then return tree end
-    -- 候选只覆盖完整音节，没打完的字母留在输入框里。
+    -- 待定音节也算在候选里，空格直接上屏补全结果。
     local replacement = Candidate("sentence", seg._start, stop, top_text(blocks), env.tree_debug and tree or "")
     replacement.preedit = cand.preedit
     return tree, replacement
@@ -1204,6 +1473,7 @@ local function init(env)
     env.translator = Component.Translator(env.engine, "", "script_translator@translator")
     env.cache, env.cache_size, env.weights, env.decoded = {}, 0, {}, {}
     env.raw, env.raw_size = {}, 0
+    env.alt, env.alt_prop, env.fuzzy_sig = {}, "", ""
     -- contextual_suggestions 打开时，翻译器按上一次上屏的文字调整分数（poet.h 的 ContextualWeighted），
     -- 上屏后缓存里的分数就过期了，清掉。
     env.commit = env.engine.context.commit_notifier:connect(function()
@@ -1218,15 +1488,37 @@ local function init(env)
 end
 
 local function func(input, env)
-    local composition = env.engine.context.composition
+    local context = env.engine.context
+    local composition = context.composition
     local seg = not composition:empty() and composition:back() or nil
-    local tokens, pending
+    -- 全拼补全打开时，才把末尾没打完的音节算进树。nova_qp_pend 由 nova_quanpin 写，
+    -- 带上输入长度防止上一次输入的标记残留：`码长:输入长度:原始前缀`。
+    local is_quanpin = context:get_option("quanpin")
+    -- 全拼补全默认关闭；打开后末尾没打完的音节才算进树。
+    local partial_enabled = is_quanpin and context:get_option("quanpin_partial")
+    local pend_len
+    if partial_enabled then
+        local marker = context:get_property("nova_qp_pend") or ""
+        local code_len, input_len = marker:match("^(%d+):(%d+):")
+        if code_len and tonumber(input_len) == #context.input then pend_len = tonumber(code_len) end
+    end
+    local tokens, pending, partial
     -- 只有拼音段出树。日期（orq）这类由 recognizer 认出的段，字母碰巧也能切成音节。
     if seg and seg:has_tag("abc") then
-        tokens, pending = syllables(env.engine.context.input:sub(seg._start + 1, seg._end))
+        tokens, pending, partial = syllables(context.input:sub(seg._start + 1, seg._end),
+                                            partial_enabled, pend_len)
     end
-    local stop = seg and seg._end - #(pending or "")
-    local context = env.engine.context
+    local stop = seg and (partial and seg._end or seg._end - #(pending or ""))
+    -- 模糊音/补全变体：nova_quanpin 每次输入更新时写。
+    local alt_prop = context:get_property("nova_qp_alt") or ""
+    if alt_prop ~= env.alt_prop then
+        env.alt, env.alt_prop = parse_alt(alt_prop), alt_prop
+    end
+    local fuzzy_sig = context:get_property("nova_qp_fuzzy") or ""
+    if fuzzy_sig ~= env.fuzzy_sig then
+        env.fuzzy_sig = fuzzy_sig
+        env.cache, env.cache_size, env.weights, env.decoded = {}, 0, {}, {}
+    end
     -- 重新出候选就回到树，见 nova_tree_keys 的 list_open。
     if (context:get_property("nova_list") or "") ~= "" then context:set_property("nova_list", "") end
     -- nova_lm_filter 的模型加载好之后写 nova_lm_ready。配置里开着、但插件或模型没装（或还没加载完）时，
@@ -1254,9 +1546,12 @@ local function func(input, env)
                 local offsets = token_offsets(tokens)
                 for i = 1, #tokens do
                     if offsets[i] == at then
-                        if not valid_pair(env, tokens[i]:sub(1, 2)) then
+                        local token = tokens[i]
+                        -- 末尾待定音节不是打错键，交给补全逻辑。
+                        if #token == 2 and not (partial and i == #tokens) and not valid_pair(env, token) then
                             typo = { code = code, broken = at }
                             tokens = { table.unpack(tokens, 1, i - 1) }
+                            partial = false
                             stop = cand._end
                         end
                         break
@@ -1265,7 +1560,7 @@ local function func(input, env)
             end
             if tokens and #tokens >= 1 then
                 -- 树出错时退回普通列表，不能让候选消失。
-                local ok, result, replacement = pcall(build_tree, env, tokens, seg, cand, stop)
+                local ok, result, replacement = pcall(build_tree, env, tokens, seg, cand, stop, partial)
                 if ok and result then
                     tree = result
                     pinned = next(parse_pins(env, tokens, token_offsets(tokens), context.input:sub(seg._start + 1, seg._end))) ~= nil
@@ -1274,7 +1569,8 @@ local function func(input, env)
                     log.error("nova_sentences: " .. tostring(result))
                 end
             end
-            -- 只打了一个字母：还没有词块，面板不显示，输入框里也只留这个字母。
+            -- 非全拼只打了一个字母：还没有词块，面板不显示，输入框里也只留这个字母。
+            -- 全拼的单字母已经是待定 token，会正常出候选。
             if tokens and #tokens == 0 and not typo then
                 tree = "\n"
                 shown = Candidate("raw", seg._start, seg._end, pending, "")
@@ -1303,11 +1599,14 @@ local function func(input, env)
         if pinned then break end
         if first then
             first = false
-            if tokens and #tokens >= 2 then
+            -- 全拼补全打开时 1 个音节也补：GPT-2 可以据此在同音字/模糊音/待定补全里按上下文重选。
+            -- 双拼保持原样（2 个音节起才补），单音节的同音字由 LM 自己的 beam 处理。
+            if tokens and (#tokens >= 2 or (partial_enabled and #tokens == 1)) then
                 local added = 0
                 for _, path in ipairs(sentences(env, tokens)) do
                     -- 词库里有多于音节数的词条（喜欢你），它们不是这串按键的整句。
-                    if path[1] ~= cand.text and utf8.len(path[1]) == #tokens then
+                    -- shown 可能已经被树替换（补全/模糊音的读法），不要再作为整句补一遍。
+                    if path[1] ~= shown.text and path[1] ~= cand.text and utf8.len(path[1]) == #tokens then
                         local extra = Candidate("sentence", seg._start, stop, path[1], "")
                         extra.preedit = cand.preedit
                         yield(extra)
@@ -1324,4 +1623,6 @@ local function fini(env)
     if env.commit then env.commit:disconnect() end
 end
 
-return { init = init, func = func, fini = fini }
+-- _syllables / _variants / _words_from / _decode / _build_tree 只给离线测试用。
+return { init = init, func = func, fini = fini, _syllables = syllables, _variants = span_variants_for_key,
+         _words_from = words_from, _decode = decode, _build_tree = build_tree }

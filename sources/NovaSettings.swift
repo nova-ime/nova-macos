@@ -24,14 +24,25 @@ enum NovaOptions {
     ("flypy", "小鹤双拼", ""),
     ("mspy", "微软双拼", "ing 是 ;"),
     ("sogou", "搜狗双拼", "ing 是 ;"),
-    ("quanpin", "全拼", "可以只打声母：wm 我们")
+    ("quanpin", "全拼", "可以只打声母，没打完也出候选")
   ]
 
   // 面板里的开关：Rime 选项名、说明。
   static let toggles: [(id: String, name: String)] = [
     ("full_shape", "全角字符"),
-    ("ascii_punct", "中文状态下用英文标点")
+    ("ascii_punct", "中文状态下用英文标点"),
+    ("quanpin_partial", "全拼补全：没打完也出候选"),
+    ("fuzzy_zcs", "模糊音：平翘舌（zh/z、ch/c、sh/s）"),
+    ("fuzzy_nasal", "模糊音：前后鼻音（an/ang、en/eng、in/ing、ian/iang、uan/uang）"),
+    ("fuzzy_nl", "模糊音：n/l"),
+    ("fuzzy_fh", "模糊音：f/h"),
+    ("fuzzy_rl", "模糊音：r/l")
   ]
+
+  // 只用来分组显示；模糊音和全拼补全都默认关，用户在设置里打开。
+  private static let fuzzyToggles: Set<String> = ["fuzzy_zcs", "fuzzy_nasal", "fuzzy_nl", "fuzzy_fh", "fuzzy_rl"]
+
+  static func isFuzzy(_ id: String) -> Bool { fuzzyToggles.contains(id) }
 
   static var layout: String {
     get { UserDefaults.standard.string(forKey: layoutKey) ?? "zrm" }
@@ -44,7 +55,9 @@ enum NovaOptions {
 
   static var layoutChosen: Bool { UserDefaults.standard.bool(forKey: chosenKey) }
 
-  static func toggle(_ id: String) -> Bool { UserDefaults.standard.bool(forKey: "NovaOption.\(id)") }
+  static func toggle(_ id: String) -> Bool {
+    UserDefaults.standard.bool(forKey: "NovaOption.\(id)")
+  }
 
   static func setToggle(_ id: String, _ value: Bool) {
     UserDefaults.standard.set(value, forKey: "NovaOption.\(id)")
@@ -136,20 +149,29 @@ private struct OptionsTab: View {
   @State private var values = Dictionary(uniqueKeysWithValues: NovaOptions.toggles.map { ($0.id, NovaOptions.toggle($0.id)) })
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 12) {
-      ForEach(NovaOptions.toggles, id: \.id) { item in
-        Toggle(item.name, isOn: Binding(
-          get: { values[item.id] ?? false },
-          set: { values[item.id] = $0; NovaOptions.setToggle(item.id, $0) }))
+    ScrollView {
+      VStack(alignment: .leading, spacing: 12) {
+        ForEach(NovaOptions.toggles.indices, id: \.self) { index in
+          if NovaOptions.isFuzzy(NovaOptions.toggles[index].id)
+            && (index == 0 || !NovaOptions.isFuzzy(NovaOptions.toggles[index - 1].id)) {
+            Text("模糊音（全拼）").font(.headline).padding(.top, 4)
+          }
+          Toggle(NovaOptions.toggles[index].name, isOn: Binding(
+            get: { values[NovaOptions.toggles[index].id] ?? false },
+            set: {
+              values[NovaOptions.toggles[index].id] = $0
+              NovaOptions.setToggle(NovaOptions.toggles[index].id, $0)
+            }))
+        }
+        Divider()
+        Text("中英切换：单按 Shift。").foregroundColor(.secondary)
+        Divider()
+        NovaAuxSection()
+        Spacer()
       }
-      Divider()
-      Text("中英切换：单按 Shift。").foregroundColor(.secondary)
-      Divider()
-      NovaAuxSection()
-      Spacer()
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .padding(8)
     }
-    .frame(maxWidth: .infinity, alignment: .leading)
-    .padding(8)
   }
 }
 
@@ -157,7 +179,8 @@ private struct HelpTab: View {
   private let sections: [(String, [(String, String)])] = [
     ("打字", [
       ("整句", "连着打，空格整句上屏。输入框里是首选整句，面板里是原始字母。"),
-      ("没打完的字母", "末尾没打完的音节不参与解码，前面的词不会跟着闪。"),
+      ("没打完的音节", "全拼在设置 → 选项打开「全拼补全」后，可以只打一半：m、muq、zhon 都出候选，空格直接上屏补全结果。双拼仍按完整音节。"),
+      ("模糊音", "全拼支持平翘舌、前后鼻音、n/l、f/h、r/l，在设置 → 选项里可以打开。"),
       ("中英切换", "单按 Shift。以大写字母开头直接打英文。"),
       ("邮箱、网址", "照常打 abc@qq.com、www.x.cn，整段原样上屏。")
     ]),

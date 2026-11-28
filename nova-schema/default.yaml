@@ -18,6 +18,12 @@ switcher:
     - mspy
     - sogou
     - quanpin
+    - quanpin_partial
+    - fuzzy_zcs
+    - fuzzy_nasal
+    - fuzzy_nl
+    - fuzzy_fh
+    - fuzzy_rl
     - full_shape
     - ascii_punct
     - simplification
