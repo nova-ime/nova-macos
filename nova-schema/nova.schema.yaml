@@ -34,6 +34,8 @@ switches:
 
 engine:
   processors:
+    # 全拼按左 Shift 切英文时先上屏原始字母，见 lua/nova_shift.lua。
+    - lua_processor@*nova_shift
     - ascii_composer
     - recognizer
     - key_binder
