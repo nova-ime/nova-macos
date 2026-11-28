@@ -48,6 +48,8 @@ local FUZZY_INITIALS = {
     { "ch", "c", "zcs" },
     { "sh", "s", "zcs" },
     { "n", "l", "nl" },
+    { "f", "h", "fh" },
+    { "r", "l", "rl" },
 }
 local FUZZY_FINALS = {
     { "ang", "an", "nasal" },
@@ -56,7 +58,7 @@ local FUZZY_FINALS = {
     { "iang", "ian", "nasal" },
     { "uang", "uan", "nasal" },
 }
-local FUZZY_GROUPS = { "zcs", "nasal", "nl" }
+local FUZZY_GROUPS = { "zcs", "nasal", "nl", "fh", "rl" }
 -- 参考 nova_sentences 的 FUZZY_COST，单位和 log(quality) 一样；合并规则数越多罚得越重。
 local FUZZY_ALT_COST = 2.5
 -- 待定音节猜了一个完整音节后，其余高频补全的罚分（第 2 名起）。
@@ -220,7 +222,7 @@ end
 
 local function load_table()
     if T then return T end
-    T = { code = {}, uni = {}, bi = {}, lu = {}, lp = {}, prefix_syl = {},
+    T = { code = {}, uni = {}, bi = {}, lu = {}, lp = {}, prefix_syl = {}, prefix_code = {},
           inv = {}, rev = {}, maxl = 1, fix = {}, maxfix = 0, fuzzy = {}, fuzzy_typo = {}, maxfuzzy = 0,
           sp = {}, sp_key = {}, sp_first = {} }
     local path = find_file(TABLE_FILE)
@@ -258,6 +260,9 @@ local function load_table()
     end
     for prefix, m in pairs(mass) do
         T.lp[prefix] = math.log((m + 1) / total)
+        -- 全拼补全开关关闭时沿用旧行为：待定音节只占一个双拼键，
+        -- 不提前猜成某个完整音节。
+        T.prefix_code[prefix] = T.code[best[prefix]]:sub(1, 1)
     end
     -- 每个前缀只留最常用的几个补全音节，待定音节猜主码和备选时用。
     for _, list in pairs(T.prefix_syl) do
@@ -331,7 +336,7 @@ local function bigram(a, b)
 end
 
 -- 一串小写字母切成单元。prev 是它前面的音节（没有时为 ""），after_abbr 是它前面的单元是不是简拼。
-local function segment(text, prev, after_abbr, fuzzy)
+local function segment(text, prev, after_abbr, fuzzy, partial)
     local n = #text
     local best = {}
     for i = 0, n do best[i] = {} end
@@ -421,14 +426,17 @@ local function segment(text, prev, after_abbr, fuzzy)
     if top_part and T.code[top_part] then
         out[1] = { raw = top_part, code = T.code[top_part], kind = "s" }
     elseif top_part then
-        -- 只有声母时保留一个双拼键，让引擎按这个声母补全所有音节；
-        -- 已经带了韵母字母（zho、zhon、ten、zua）时猜词频最高的完整音节，
-        -- 否则引擎会把它们都压成声母键，zhon 会出所有 zh 音节。
         local code
-        if INITIAL_KEY[top_part] then
+        if not partial then
+            -- 全拼补全关闭：和旧版一样只留一个双拼键，末尾的字母不参与解码。
+            code = T.prefix_code[top_part] or INITIAL_KEY[split_syllable(top_part)] or top_part:sub(1, 1)
+        elseif INITIAL_KEY[top_part] then
+            -- 只有声母时保留一个双拼键，让引擎按这个声母补全所有音节。
             -- 主码用用户实际打的声母键（z 就是 z，zh 才是 v），模糊音的另一边作为备选。
             code = INITIAL_KEY[top_part]
         else
+            -- 已经带了韵母字母（zho、zhon、ten、zua）时猜词频最高的完整音节，
+            -- 否则引擎会把它们都压成声母键，zhon 会出所有 zh 音节。
             local list = T.prefix_syl[top_part]
             code = list and list[1] and T.code[list[1]]
             if not code then
@@ -456,13 +464,13 @@ local function segment(text, prev, after_abbr, fuzzy)
 end
 
 -- 一段原始字母（可能夹着大写和 '）切成单元。prev、after_abbr 同上。
-local function tokenize(raw, prev, after_abbr, layout, fuzzy)
+local function tokenize(raw, prev, after_abbr, layout, fuzzy, partial)
     local sp = layout and layout ~= "quanpin"
     local out, pos = {}, 1
     while pos <= #raw do
         local run = raw:match(sp and "^[%l;]+" or "^%l+", pos)
         if run then
-            local units = sp and sp_segment(run, layout) or segment(run, prev, after_abbr, fuzzy)
+            local units = sp and sp_segment(run, layout) or segment(run, prev, after_abbr, fuzzy, partial)
             for _, unit in ipairs(units) do out[#out + 1] = unit end
             pos = pos + #run
         else
@@ -744,7 +752,7 @@ local function edit(env, ctx, at, removed, text, at_end)
     end
     local new = {}
     for i = 1, lo - 1 do new[#new + 1] = units[i] end
-    for _, unit in ipairs(tokenize(window, prev, after_abbr, env.layout, env.fuzzy)) do new[#new + 1] = unit end
+    for _, unit in ipairs(tokenize(window, prev, after_abbr, env.layout, env.fuzzy, ctx:get_option("quanpin_partial"))) do new[#new + 1] = unit end
     for i = hi + 1, #units do new[#new + 1] = units[i] end
     local cursor
     if not at_end then

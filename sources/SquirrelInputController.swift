@@ -30,6 +30,9 @@ final class SquirrelInputController: IMKInputController {
   private var chordTimer: Timer?
   private var chordDuration: TimeInterval = 0
   private var currentApp: String = ""
+  // 全拼时左 Shift 切英文：记录按下时间，判断是短按切换还是配合别的键。
+  private var leftShiftTime: Date?
+  private var leftShiftUsed = false
 
   // swiftlint:disable:next cyclomatic_complexity
   override func handle(_ event: NSEvent!, client sender: Any!) -> Bool {
@@ -61,6 +64,39 @@ final class SquirrelInputController: IMKInputController {
       if lastModifiers == modifiers {
         handled = true
         break
+      }
+      // 全拼正在输入时，左 Shift 短按切英文要先上屏用户实际打的字母（git 不是 yit）；
+      // 右 Shift 仍交给 ascii_composer 的 commit_text，长按超过 500ms 也不切换。
+      let shiftDown = modifiers.contains(.shift)
+      let shiftWasDown = lastModifiers.contains(.shift)
+      if event.keyCode == 56 && shiftDown != shiftWasDown {
+        if shiftDown {
+          if canCommitRawOnLeftShift {
+            leftShiftTime = Date()
+            leftShiftUsed = false
+            lastModifiers = modifiers
+            return true
+          }
+        } else if let start = leftShiftTime {
+          leftShiftTime = nil
+          let used = leftShiftUsed
+          leftShiftUsed = false
+          lastModifiers = modifiers
+          if !used && Date().timeIntervalSince(start) < 0.5 {
+            if isQuanpinComposing {
+              let raw = rimeProperty("nova_qp_raw") ?? ""
+              let input = rimeAPI.get_input(session).map { String(cString: $0) } ?? ""
+              commit(string: raw.isEmpty ? input : raw)
+              rimeAPI.clear_composition(session)
+            }
+            rimeAPI.set_option(session, "ascii_mode", true)
+            rimeUpdate()
+          }
+          return true
+        }
+      }
+      if leftShiftTime != nil {
+        leftShiftUsed = true
       }
       // print("[DEBUG] FLAGSCHANGED client: \(sender ?? "nil"), modifiers: \(modifiers)")
       var rimeModifiers: UInt32 = SquirrelKeycode.osxModifiersToRime(modifiers: modifiers)
@@ -94,6 +130,9 @@ final class SquirrelInputController: IMKInputController {
       rimeUpdate()
 
     case .keyDown:
+      if leftShiftTime != nil {
+        leftShiftUsed = true
+      }
       // ignore Command+X hotkeys.
       if modifiers.contains(.command) {
         break
@@ -206,6 +245,8 @@ final class SquirrelInputController: IMKInputController {
 
   override func deactivateServer(_ sender: Any!) {
     // print("[DEBUG] deactivateServer: \(sender ?? "nil")")
+    leftShiftTime = nil
+    leftShiftUsed = false
     hidePalettes()
     commitComposition(sender)
     client = nil
@@ -227,6 +268,8 @@ final class SquirrelInputController: IMKInputController {
    to clean up if that is necessary.
    */
   override func commitComposition(_ sender: Any!) {
+    leftShiftTime = nil
+    leftShiftUsed = false
     self.client ?= sender as? IMKTextInput
     // print("[DEBUG] commitComposition: \(sender ?? "nil")")
     //  commit raw input
@@ -247,6 +290,17 @@ final class SquirrelInputController: IMKInputController {
     var buffer = [CChar](repeating: 0, count: 4096)
     guard rimeAPI.get_property(session, name, &buffer, buffer.count), buffer[buffer.count - 1] == 0 else { return nil }
     return String(cString: buffer)
+  }
+
+  // 全拼正在输入（不是英文模式）。
+  private var isQuanpinComposing: Bool {
+    guard session != 0, let input = rimeAPI.get_input(session), input.pointee != 0 else { return false }
+    return rimeAPI.get_option(session, "quanpin") && !rimeAPI.get_option(session, "ascii_mode")
+  }
+
+  // 连击输入开着时 Shift 也参与组合键，不在这里接管。
+  private var canCommitRawOnLeftShift: Bool {
+    isQuanpinComposing && !rimeAPI.get_option(session, "_chord_typing")
   }
 
   // 菜单栏的 Nova 菜单：输入方式（单选）、设置、重新加载设置。

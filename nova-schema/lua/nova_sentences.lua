@@ -1491,11 +1491,13 @@ local function func(input, env)
     local context = env.engine.context
     local composition = context.composition
     local seg = not composition:empty() and composition:back() or nil
-    -- 全拼才把末尾没打完的音节算进树。nova_qp_pend 由 nova_quanpin 写，
+    -- 全拼补全打开时，才把末尾没打完的音节算进树。nova_qp_pend 由 nova_quanpin 写，
     -- 带上输入长度防止上一次输入的标记残留：`码长:输入长度:原始前缀`。
     local is_quanpin = context:get_option("quanpin")
+    -- 全拼补全默认关闭；打开后末尾没打完的音节才算进树。
+    local partial_enabled = is_quanpin and context:get_option("quanpin_partial")
     local pend_len
-    if is_quanpin then
+    if partial_enabled then
         local marker = context:get_property("nova_qp_pend") or ""
         local code_len, input_len = marker:match("^(%d+):(%d+):")
         if code_len and tonumber(input_len) == #context.input then pend_len = tonumber(code_len) end
@@ -1504,7 +1506,7 @@ local function func(input, env)
     -- 只有拼音段出树。日期（orq）这类由 recognizer 认出的段，字母碰巧也能切成音节。
     if seg and seg:has_tag("abc") then
         tokens, pending, partial = syllables(context.input:sub(seg._start + 1, seg._end),
-                                            is_quanpin, pend_len)
+                                            partial_enabled, pend_len)
     end
     local stop = seg and (partial and seg._end or seg._end - #(pending or ""))
     -- 模糊音/补全变体：nova_quanpin 每次输入更新时写。
@@ -1597,9 +1599,9 @@ local function func(input, env)
         if pinned then break end
         if first then
             first = false
-            -- 全拼 1 个音节也补：GPT-2 可以据此在同音字/模糊音/待定补全里按上下文重选。
+            -- 全拼补全打开时 1 个音节也补：GPT-2 可以据此在同音字/模糊音/待定补全里按上下文重选。
             -- 双拼保持原样（2 个音节起才补），单音节的同音字由 LM 自己的 beam 处理。
-            if tokens and (#tokens >= 2 or (is_quanpin and #tokens == 1)) then
+            if tokens and (#tokens >= 2 or (partial_enabled and #tokens == 1)) then
                 local added = 0
                 for _, path in ipairs(sentences(env, tokens)) do
                     -- 词库里有多于音节数的词条（喜欢你），它们不是这串按键的整句。
