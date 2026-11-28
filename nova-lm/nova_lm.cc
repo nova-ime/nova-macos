@@ -1384,11 +1384,16 @@ class NovaLmFilter : public rime::Filter {
       }
       vector<string> alts;
       string own = split(blk.fields[4], '\x1f')[0];
-      if (orange(blk) && !blk.alt.empty()) alts.push_back(encode(blk.alt) + "\x1f\x1f" + blk.fields[2]);
-      if (had_overview && (orange(blk) || purple))
+      bool lm_alt_added = orange(blk) && !blk.alt.empty();
+      if (lm_alt_added) alts.push_back(encode(blk.alt) + "\x1f\x1f" + blk.fields[2]);
+      // 待定音节（abbr：display key 里的 V）的备选是用户此刻唯一能选的字，
+      // 不能因为 LM 认为它不橙不紫就丢掉；简拼块同理。
+      // 只有 LM 自己把 blk.alt 加到了 alts 里时才跳过重复项；非橙的待定块要按 Lua 的顺序保留。
+      bool skip_lm_alt = blk.abbr ? lm_alt_added : !blk.alt.empty();
+      if (had_overview && (orange(blk) || purple || blk.abbr))
         for (size_t k = 5; k < blk.fields.size() && (int)alts.size() < kAlts; k++) {
           string alt = split(blk.fields[k], '\x1f')[0];
-          if (alt != (blk.alt.empty() ? "" : encode(blk.alt)) && alt != own) alts.push_back(blk.fields[k]);
+          if ((!skip_lm_alt || blk.alt.empty() || alt != encode(blk.alt)) && alt != own) alts.push_back(blk.fields[k]);
         }
       if (any_aux || alts.empty() || labels + (int)alts.size() > kLabels) alts.clear();
       labels += (int)alts.size();

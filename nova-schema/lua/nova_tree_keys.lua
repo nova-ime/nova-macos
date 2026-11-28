@@ -11,7 +11,8 @@
 -- 等于输入长度表示光标也在末尾，但焦点在最后一块（Tab 跳到最后一块的末尾）。
 -- 选词时只冻结前面的块，所选范围和它后面的部分重新解码，后面的字可以跟新选的字组词
 -- （显 + 时期 → 显示器）；用户选过的块不管在哪都保留。选的词覆盖整个输入时直接上屏。
--- 空格不管光标在哪都上屏整句；末尾有半个音节时上屏前面的完整部分，见 commit_before_pending。
+-- 空格不管光标在哪都上屏整句；全拼末尾的半个音节由树把补全结果覆盖到整个输入，直接上屏；
+-- 双拼或树没建出来时仍只上屏前面的完整部分，见 commit_before_pending。
 -- ; 等于数字 1。有焦点时 [ / ] 伸缩焦点块：[ 让出最后一个音节给右边的块，让出的音节和右边那块一起单独解码，见 shrink；
 -- ] 往右扩一个音节，把右边那块的第一个音节并进来，文字不重新解码，见 expand。没有焦点时 [ ] 照常是标点。
 -- Shift+Delete 或 Control+Delete（Control+K 经 key_binder 变成前者）：把焦点块的词从用户词库里删掉，
@@ -26,6 +27,7 @@ local words = require("nova_words")
 local WILDCARD = "V"
 
 local LEFT, RIGHT, SPACE = 0xff51, 0xff53, 0x20
+local RETURN = 0xff0d
 local HOME, END, BACKSPACE, DELETE = 0xff50, 0xff57, 0xff08, 0xffff
 local PAGE_UP, PAGE_DOWN, COMMA, PERIOD = 0xff55, 0xff56, 0x2c, 0x2e
 local UP, DOWN = 0xff52, 0xff54
@@ -228,8 +230,10 @@ function learn_bounds(ctx, text)
     end
     for pos, prefix in resized:gmatch("(%d+):([^\n]*)\n") do
         local a, b = ending[tonumber(pos)], starting[tonumber(pos)]
-        if a and b and input:sub(1, #prefix) == prefix then
-            bounds.put(block_code(input, a), a.text, block_code(input, b), b.text)
+        local left, right = a and block_code(input, a) or "", b and block_code(input, b) or ""
+        -- 全拼末尾 1 字节的待定音节解不出完整码（block_code 返回空），这种边界不学。
+        if a and b and left ~= "" and right ~= "" and input:sub(1, #prefix) == prefix then
+            bounds.put(left, a.text, right, b.text)
         end
     end
 end
@@ -378,6 +382,8 @@ local function find_choice(blocks, focus, label)
 end
 
 -- 段内每个音节的起止，和 nova_sentences 的 syllables 同一套切法。
+-- 全拼末尾 1 字节的待定音节不算进来：伸缩、删词、block_chars 在这些块上安全地不生效。
+-- 2 字节的补全猜测是确定的音节，照常参与。
 local function syllable_ranges(input)
     local ranges, pos = {}, 1
     while pos <= #input do
@@ -716,7 +722,8 @@ local function pending_letter(input)
     end
 end
 
--- 空格：末尾有半个音节时，完整的部分直接上屏，半个音节留下继续输入。
+-- 空格：末尾有半个音节、但树没有覆盖它时（双拼，或全拼树建失败），完整的部分直接上屏，
+-- 半个音节留下继续输入。全拼正常时树的首选覆盖整个输入，走不到这里。
 -- Rime 默认只确认前面那段、不上屏，后面那个字母自成一段，必须补全它整句才能上屏。
 local function commit_before_pending(env, seg)
     local ctx = env.engine.context
@@ -764,6 +771,17 @@ local function func(key, env)
         return 1
     end
     if key:ctrl() then return 2 end
+    -- 回车原样上屏用户打的字母。全拼在引擎里的输入已经换成了双拼码（git 会变成 yi+t），
+    -- 直接交给 Rime 的 express_editor 会提交 yit；用户要的是 git。
+    if code == RETURN and ctx:get_option("quanpin") and not ctx:get_option("ascii_mode") then
+        local seg = ctx.composition:back()
+        local raw = ctx:get_property("nova_qp_raw") or ""
+        if seg and seg.selected_index == 0 and not list_open(ctx) and raw ~= "" and raw ~= ctx.input then
+            env.engine:commit_text(raw)
+            ctx:clear()
+            return 1
+        end
+    end
     local cursor, focused = cursor_of(ctx)
     local inside = cursor < #ctx.input
     -- 光标在末尾但焦点在最后一块时，接着打字就是普通输入，先取消焦点。
